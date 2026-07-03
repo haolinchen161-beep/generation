@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """Build a conservative, inspectable B-Rep motif graph M=(Vm, Em, Pm).
 
-v3.1 changes the first draft in three important ways:
-  1) it avoids a dense complete relation graph;
-  2) it only reports structural relations with local/geometric evidence;
-  3) it records rejected relation candidates for audit.
+v3.2 is intentionally sparse.  It avoids relation flooding by:
+  1) grouping faces into a small set of candidate motif nodes;
+  2) emitting only relations with explicit local/topological evidence;
+  3) applying per-relation caps;
+  4) writing rejected candidates for audit.
 
-The output is still a weak, algorithm-extracted structural prior, not manual
+The output is a weak, algorithm-extracted structural prior, not manual
 semantic truth.
 """
 
@@ -16,7 +17,7 @@ import os
 import pickle
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -43,6 +44,18 @@ RELATION_TYPES = {
     "embedded_in",
     "repeated_with",
     "bounded_by",
+}
+
+RELATION_CAPS = {
+    "embedded_in": 6,
+    "bounded_by": 6,
+    "opposite_to": 8,
+    "parallel_to": 8,
+    "coplanar_with": 4,
+    "orthogonal_to": 10,
+    "smooth_connected": 5,
+    "repeated_with": 5,
+    "adjacent_to": 6,
 }
 
 RELATION_PRIORITY = {
@@ -85,7 +98,6 @@ def _normal(face_ids: Sequence[int], faces: Sequence[Dict[str, Any]]) -> np.ndar
     normals = [_unit(faces[int(fid)]["normal"]) for fid in face_ids if 0 <= int(fid) < len(faces)]
     if not normals:
         return np.asarray([1.0, 0.0, 0.0], dtype=float)
-    # Resolve +/- ambiguity by orienting all normals to the first one.
     base = normals[0]
     aligned = [n if np.dot(n, base) >= 0 else -n for n in normals]
     return _unit(np.mean(np.asarray(aligned), axis=0))
@@ -106,11 +118,11 @@ def _adjacent_count(ids_a: Sequence[int], ids_b: Sequence[int], face_adj: np.nda
     return count
 
 
-def _components(face_ids: Sequence[int], face_adj: np.ndarray, normal_filtered_faces: Sequence[Dict[str, Any]] | None = None, normal_dot_min: float = 0.92) -> List[List[int]]:
+def _components(face_ids: Sequence[int], face_adj: np.ndarray, faces: Sequence[Dict[str, Any]] | None = None, normal_dot_min: float = 0.92) -> List[List[int]]:
     id_set = {int(x) for x in face_ids}
     seen = set()
     comps: List[List[int]] = []
-    face_map = {int(f["face_id"]): f for f in normal_filtered_faces or []}
+    face_map = {int(f["face_id"]): f for f in faces or []}
     for seed in sorted(id_set):
         if seed in seen:
             continue
@@ -172,7 +184,6 @@ def _make_rel(source: str, target: str, typ: str, score: float, evidence: Dict[s
 
 
 def _select_relations(candidates: List[Dict[str, Any]], node_count: int) -> List[Dict[str, Any]]:
-    """Keep a sparse relation graph while preserving structural evidence."""
     unique: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     undirected = {"parallel_to", "opposite_to", "orthogonal_to", "coplanar_with", "adjacent_to"}
     for rel in candidates:
@@ -187,24 +198,28 @@ def _select_relations(candidates: List[Dict[str, Any]], node_count: int) -> List
         if key not in unique or float(rel.get("score", 0.0)) > float(unique[key].get("score", 0.0)):
             unique[key] = rel
 
-    # Keep non-adjacent structural relations first; adjacency is only a support relation.
-    rels = list(unique.values())
-    rels.sort(key=lambda r: (RELATION_PRIORITY.get(str(r["type"]), 99), -float(r.get("score", 0.0)), str(r["source"]), str(r["target"])))
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for rel in unique.values():
+        grouped[str(rel["type"])].append(rel)
 
-    per_node_adjacent: Dict[str, int] = defaultdict(int)
     kept: List[Dict[str, Any]] = []
-    max_total = max(12, min(70, 3 * max(node_count, 1) + 8))
-    for rel in rels:
-        typ = str(rel["type"])
-        if typ == "adjacent_to":
+    per_node_degree: Dict[str, int] = defaultdict(int)
+    max_total = max(6, min(24, int(0.55 * max(node_count, 1)) + 6))
+
+    for typ in sorted(grouped, key=lambda t: RELATION_PRIORITY.get(t, 99)):
+        items = sorted(grouped[typ], key=lambda r: -float(r.get("score", 0.0)))
+        cap = min(RELATION_CAPS.get(typ, 4), max(2, node_count // 3 + 2))
+        used_for_type = 0
+        for rel in items:
             src, dst = str(rel["source"]), str(rel["target"])
-            if per_node_adjacent[src] >= 2 or per_node_adjacent[dst] >= 2:
+            if per_node_degree[src] >= 4 or per_node_degree[dst] >= 4:
                 continue
-            if float(rel.get("score", 0.0)) < 0.67:
-                continue
-            per_node_adjacent[src] += 1
-            per_node_adjacent[dst] += 1
-        kept.append(rel)
+            kept.append(rel)
+            per_node_degree[src] += 1
+            per_node_degree[dst] += 1
+            used_for_type += 1
+            if used_for_type >= cap or len(kept) >= max_total:
+                break
         if len(kept) >= max_total:
             break
     return sorted(kept, key=lambda r: (str(r["source"]), str(r["target"]), str(r["type"])))
@@ -226,61 +241,61 @@ def _similar_nodes_for_repetition(nodes: List[Dict[str, Any]], global_scale: flo
         axis = int(np.argmax(np.abs(normal)))
         size_bin = int(round(float(np.sum(np.round(dims_sorted, 2))) * 10))
         buckets[(node["type"], axis, size_bin)].append(node)
+
     clusters: List[List[str]] = []
     for items in buckets.values():
-        if len(items) < 3:
+        if len(items) < 4:
             continue
         centers = np.asarray([item["properties"]["centroid"] for item in items], dtype=float)
-        spread = np.ptp(centers, axis=0)
-        if float(np.max(spread)) < 0.10 * global_scale:
+        spread_axis = int(np.argmax(np.ptp(centers, axis=0)))
+        order = np.argsort(centers[:, spread_axis])
+        sorted_items = [items[int(i)] for i in order]
+        coords = centers[order, spread_axis]
+        diffs = np.diff(coords)
+        if len(diffs) < 3:
             continue
-        clusters.append([str(item["id"]) for item in items[:8]])
-    return clusters
+        cv = float(np.std(diffs) / max(abs(float(np.mean(diffs))), 1e-8))
+        if cv <= 0.40 and float(np.ptp(coords)) >= 0.15 * global_scale:
+            clusters.append([str(item["id"]) for item in sorted_items[:6]])
+    return clusters[:2]
 
 
 def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
     features = extract_motif_features(data)
     faces = features["face_features"]
-    face_count = int(features["face_count"])
     face_adj = np.asarray(features["face_adjacency"], dtype=int)
     global_scale = float(features.get("global_scale", 1.0))
     areas = np.asarray([float(f["area_proxy"]) for f in faces], dtype=float) if faces else np.zeros(0)
-    p15 = float(np.percentile(areas, 15)) if areas.size else 0.0
-    p35 = float(np.percentile(areas, 35)) if areas.size else 0.0
-    p60 = float(np.percentile(areas, 60)) if areas.size else 0.0
+    p10 = float(np.percentile(areas, 10)) if areas.size else 0.0
+    p25 = float(np.percentile(areas, 25)) if areas.size else 0.0
+    p70 = float(np.percentile(areas, 70)) if areas.size else 0.0
 
-    face_by_id = {int(f["face_id"]): f for f in faces}
     used: set[int] = set()
     nodes: List[Dict[str, Any]] = []
     rejected_candidates: List[Dict[str, Any]] = []
+    gmin = np.asarray(features["global_min"], dtype=float)
+    gmax = np.asarray(features["global_max"], dtype=float)
+    tol = max(0.025 * global_scale, 1e-6)
 
-    # 1. loop/hole candidates: stricter than v3.0 to avoid treating all small interior faces as holes.
-    loop_ids = []
+    loop_ids: List[int] = []
     for f in faces:
         fid = int(f["face_id"])
-        dims = np.asarray(f["dims"], dtype=float)
         box = np.asarray(f["bbox"], dtype=float)
         mn, mx = box[:3], box[3:]
-        internal_axes = 0
-        gmin = np.asarray(features["global_min"], dtype=float)
-        gmax = np.asarray(features["global_max"], dtype=float)
-        tol = max(0.025 * global_scale, 1e-6)
-        for axis in range(3):
-            if mn[axis] > gmin[axis] + tol and mx[axis] < gmax[axis] - tol:
-                internal_axes += 1
-        compact = float(f["area_proxy"]) <= max(p35, 1e-8)
+        internal_axes = sum(1 for axis in range(3) if mn[axis] > gmin[axis] + tol and mx[axis] < gmax[axis] - tol)
+        dims = np.maximum(mx - mn, 0.0)
+        compact_extent = float(np.max(dims)) <= 0.35 * global_scale
+        compact_area = float(f["area_proxy"]) <= max(p25, 1e-8)
         high_degree = int(f["degree"]) >= 4 or int(f.get("adjacent_degree", 0)) >= 3
-        not_boundary = not bool(f["is_global_boundary"])
-        if not_boundary and internal_axes >= 2 and compact and high_degree:
+        if (not bool(f["is_global_boundary"])) and internal_axes >= 2 and compact_extent and compact_area and high_degree:
             loop_ids.append(fid)
 
     for comp in _components(loop_ids, face_adj):
-        if len(comp) <= 8:
+        if 1 <= len(comp) <= 6:
             nodes.append(_make_node(f"loop_{len(nodes)}", "loop_or_hole", comp, faces, {"detector": "strict_internal_compact_high_degree"}))
             used.update(comp)
 
-    # 2. transition candidates: small, curved, narrow or bridge-like faces only.
-    transition_ids = []
+    transition_ids: List[int] = []
     for f in faces:
         fid = int(f["face_id"])
         if fid in used:
@@ -288,32 +303,27 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         area = float(f["area_proxy"])
         aspect = float(f["aspect_ratio"])
         degree = int(f.get("adjacent_degree", f.get("degree", 0)))
-        not_boundary = not bool(f["is_global_boundary"])
         curved = float(f.get("curvature_proxy", 0.0)) > 0.5
-        if (curved and area <= max(p60, 1e-8)) or (not_boundary and degree >= 2 and area <= max(p15, 1e-8) and aspect >= 8.0):
+        if (curved and area <= max(p25, 1e-8)) or ((not bool(f["is_global_boundary"])) and degree >= 2 and area <= max(p10, 1e-8) and aspect >= 12.0):
             transition_ids.append(fid)
 
     for comp in _components(transition_ids, face_adj):
-        if len(comp) <= 6:
+        if 1 <= len(comp) <= 4:
             nodes.append(_make_node(f"transition_{len(nodes)}", "transition_group", comp, faces, {"detector": "small_curved_or_narrow_bridge"}))
             used.update(comp)
 
-    # 3. sheet-like groups: large non-boundary faces, grouped by local adjacency and normal.
-    sheet_ids = [int(f["face_id"]) for f in faces if int(f["face_id"]) not in used and float(f["area_proxy"]) >= max(p60, 1e-8)]
+    sheet_ids = [int(f["face_id"]) for f in faces if int(f["face_id"]) not in used and float(f["area_proxy"]) >= max(p70, 1e-8)]
     for comp in _components(sheet_ids, face_adj, faces, normal_dot_min=0.94):
-        if not comp:
-            continue
-        nodes.append(_make_node(f"sheet_{len(nodes)}", "sheet_like_group", comp, faces, {"detector": "large_area_normal_component"}))
-        used.update(comp)
+        if comp:
+            nodes.append(_make_node(f"sheet_{len(nodes)}", "sheet_like_group", comp, faces, {"detector": "large_area_normal_component"}))
+            used.update(comp)
 
-    # 4. boundary groups: remaining global-boundary connected components.
     boundary_ids = [int(f["face_id"]) for f in faces if int(f["face_id"]) not in used and bool(f["is_global_boundary"])]
     for comp in _components(boundary_ids, face_adj):
         if comp:
             nodes.append(_make_node(f"boundary_{len(nodes)}", "boundary_group", comp, faces, {"detector": "global_bbox_boundary"}))
             used.update(comp)
 
-    # 5. remaining faces: compact connected face groups.
     remaining_ids = [int(f["face_id"]) for f in faces if int(f["face_id"]) not in used]
     for comp in _components(remaining_ids, face_adj):
         if comp:
@@ -324,7 +334,6 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
     def add_candidate(src: str, dst: str, typ: str, score: float, evidence: Dict[str, Any]) -> None:
         candidates.append(_make_rel(src, dst, typ, score, evidence))
 
-    # Pairwise structural relations with local evidence.
     for i, a in enumerate(nodes):
         a_ids = a["face_ids"]
         a_mn, a_mx = _bbox(a_ids, faces)
@@ -339,38 +348,33 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
             b_area = _area(b_ids, faces)
             adj = _adjacent_count(a_ids, b_ids, face_adj)
             gap = _bbox_gap(a_mn, a_mx, b_mn, b_mx)
-            dot = _dot(a_n, b_n)
-            abs_dot = abs(dot)
+            abs_dot = abs(_dot(a_n, b_n))
             area_ratio = min(a_area, b_area) / max(max(a_area, b_area), 1e-8)
-
-            if adj >= 2:
-                add_candidate(a["id"], b["id"], "adjacent_to", min(1.0, adj / 3.0), {"adjacent_face_pairs": adj})
-            elif adj == 1 and (a["type"] == "transition_group" or b["type"] == "transition_group" or a["type"] == "loop_or_hole" or b["type"] == "loop_or_hole"):
-                add_candidate(a["id"], b["id"], "adjacent_to", 0.67, {"adjacent_face_pairs": adj, "local_feature_touch": True})
-
             dominant = int(np.argmax(np.abs(a_n)))
             overlap_axes = [axis for axis in range(3) if axis != dominant]
             overlap = _projection_overlap(a_mn, a_mx, b_mn, b_mx, overlap_axes)
             plane_dist = abs(float(np.dot(b_c - a_c, a_n)))
-            near = gap <= 0.05 * global_scale or adj > 0
+            structural_touch = adj > 0 or gap <= 0.015 * global_scale
 
-            if abs_dot >= 0.97 and area_ratio >= 0.20 and overlap >= 0.50:
-                if plane_dist <= 0.015 * global_scale:
-                    add_candidate(a["id"], b["id"], "coplanar_with", 1.0 - plane_dist / max(0.015 * global_scale, 1e-8), {"plane_dist": round(plane_dist, 6), "overlap": round(overlap, 6)})
-                elif near or plane_dist <= 0.25 * global_scale:
+            if adj >= 2 and (a["type"] in {"transition_group", "loop_or_hole"} or b["type"] in {"transition_group", "loop_or_hole"}):
+                add_candidate(a["id"], b["id"], "adjacent_to", min(1.0, adj / 3.0), {"adjacent_face_pairs": adj})
+
+            if abs_dot >= 0.985 and area_ratio >= 0.35 and overlap >= 0.65:
+                if plane_dist <= 0.010 * global_scale:
+                    add_candidate(a["id"], b["id"], "coplanar_with", 1.0 - plane_dist / max(0.010 * global_scale, 1e-8), {"plane_dist": round(plane_dist, 6), "overlap": round(overlap, 6), "area_ratio": round(area_ratio, 6)})
+                elif structural_touch or plane_dist <= 0.18 * global_scale:
                     typ = "opposite_to" if plane_dist > 0.025 * global_scale else "parallel_to"
-                    add_candidate(a["id"], b["id"], typ, min(1.0, overlap * abs_dot), {"plane_dist": round(plane_dist, 6), "overlap": round(overlap, 6), "area_ratio": round(area_ratio, 6)})
+                    add_candidate(a["id"], b["id"], typ, min(1.0, overlap * abs_dot), {"plane_dist": round(plane_dist, 6), "overlap": round(overlap, 6), "area_ratio": round(area_ratio, 6), "gap": round(gap, 6), "adjacent_face_pairs": adj})
                 else:
                     rejected_candidates.append({"source": a["id"], "target": b["id"], "type": "parallel_or_opposite", "reason": "not_near_no_structural_support", "overlap": round(overlap, 6), "plane_dist": round(plane_dist, 6)})
-            elif abs_dot <= 0.12 and near and area_ratio >= 0.15:
-                add_candidate(a["id"], b["id"], "orthogonal_to", 1.0 - abs_dot, {"gap": round(gap, 6), "adjacent_face_pairs": adj, "area_ratio": round(area_ratio, 6)})
+            elif abs_dot <= 0.08 and adj >= 1 and area_ratio >= 0.25:
+                add_candidate(a["id"], b["id"], "orthogonal_to", 1.0 - abs_dot, {"adjacent_face_pairs": adj, "area_ratio": round(area_ratio, 6), "gap": round(gap, 6)})
 
-    # Thin-wall node from strong opposite relation.
     preliminary = _select_relations(candidates, len(nodes))
+    lookup = {str(n["id"]): n for n in nodes}
     thin_nodes: List[Dict[str, Any]] = []
-    lookup = _node_lookup(nodes)
     for rel in preliminary:
-        if rel["type"] != "opposite_to" or float(rel.get("score", 0.0)) < 0.60:
+        if rel["type"] != "opposite_to" or float(rel.get("score", 0.0)) < 0.70:
             continue
         src = lookup.get(str(rel["source"]))
         dst = lookup.get(str(rel["target"]))
@@ -380,7 +384,7 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         c1 = _center(dst["face_ids"], faces)
         n0 = _normal(src["face_ids"], faces)
         distance = abs(float(np.dot(c1 - c0, n0)))
-        if 1e-6 < distance <= 0.10 * global_scale:
+        if 1e-6 < distance <= 0.08 * global_scale:
             node = _make_node(
                 f"thinwall_{len(nodes) + len(thin_nodes)}",
                 "thin_wall_pair",
@@ -391,12 +395,10 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
             thin_nodes.append(node)
     nodes.extend(thin_nodes)
 
-    # Add bounded_by links from thin wall nodes.
     for node in thin_nodes:
         for src_id in node.get("properties", {}).get("source_nodes", []):
             candidates.append(_make_rel(node["id"], src_id, "bounded_by", 1.0, {"thin_wall_source": True}))
 
-    # Embedded relation for loop/hole: only if its centroid lies in a larger sheet/boundary bbox.
     for node in nodes:
         if node["type"] != "loop_or_hole":
             continue
@@ -416,26 +418,25 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         if best is not None:
             candidates.append(_make_rel(node["id"], best["id"], "embedded_in", 1.0, {"container_area": round(best_area, 6)}))
 
-    # Smooth-connected only for transition nodes and their strongest adjacent neighbors.
-    candidate_adj = [c for c in candidates if c["type"] == "adjacent_to"]
+    adjacent_candidates = [c for c in candidates if c["type"] == "adjacent_to"]
     for node in nodes:
         if node["type"] != "transition_group":
             continue
-        neigh = [rel for rel in candidate_adj if rel["source"] == node["id"] or rel["target"] == node["id"]]
+        neigh = [rel for rel in adjacent_candidates if rel["source"] == node["id"] or rel["target"] == node["id"]]
         neigh.sort(key=lambda r: -float(r.get("score", 0.0)))
-        for rel in neigh[:2]:
+        if neigh:
+            rel = neigh[0]
             other = rel["target"] if rel["source"] == node["id"] else rel["source"]
             candidates.append(_make_rel(node["id"], other, "smooth_connected", rel.get("score", 0.67), {"from_adjacent_to": True}))
 
-    # Repeated features: conservative clusters of similar groups.
     for cluster in _similar_nodes_for_repetition(nodes, global_scale):
-        face_ids: List[int] = []
         lookup = _node_lookup(nodes)
+        face_ids: List[int] = []
         for node_id in cluster:
             face_ids.extend(lookup[node_id]["face_ids"])
-        rep_node = _make_node(f"repeated_{len(nodes)}", "repeated_feature", face_ids, faces, {"member_nodes": cluster, "detector": "similar_size_normal_spacing"})
+        rep_node = _make_node(f"repeated_{len(nodes)}", "repeated_feature", face_ids, faces, {"member_nodes": cluster, "detector": "regular_similar_size_normal_spacing"})
         nodes.append(rep_node)
-        for node_id in cluster[:4]:
+        for node_id in cluster[:3]:
             candidates.append(_make_rel(rep_node["id"], node_id, "repeated_with", 1.0, {"cluster_size": len(cluster)}))
 
     relations = _select_relations(candidates, len(nodes))
@@ -447,7 +448,7 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         "has_loop_or_hole": node_counts["loop_or_hole"] > 0,
         "has_transition": node_counts["transition_group"] > 0,
         "has_repeated_feature": node_counts["repeated_feature"] > 0,
-        "motif_rich": len(nodes) >= 4 and len(relations) >= 3 and (rel_counts["parallel_to"] + rel_counts["opposite_to"] + rel_counts["orthogonal_to"] + rel_counts["embedded_in"] + rel_counts["bounded_by"] > 0),
+        "motif_rich": len(nodes) >= 4 and (rel_counts["opposite_to"] + rel_counts["embedded_in"] + rel_counts["bounded_by"] + rel_counts["repeated_with"] >= 1 or rel_counts["orthogonal_to"] >= 2),
         "raw_relation_candidates": len(candidates),
         "kept_relation_count": len(relations),
         "rejected_candidate_count": len(rejected_candidates),
@@ -464,7 +465,7 @@ def build_motif_graph_for_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         "rejected_relation_candidates": rejected_candidates[:80],
         "parser_backend": features.get("parser_backend", "unknown"),
         "geometry_sampling_quality": features.get("geometry_sampling_quality", "unknown"),
-        "label_source": "algorithm_extracted_motif_conservative_v3_1",
+        "label_source": "algorithm_extracted_motif_sparse_v3_2",
         "is_manual_ground_truth": False,
     }
 
@@ -513,7 +514,7 @@ def build_motif_graphs(workdir: str) -> Dict[str, Any]:
     raw_candidates = sum(int(graph.get("motif_summary", {}).get("raw_relation_candidates", 0)) for graph in graphs)
     kept_relations = sum(int(graph.get("motif_summary", {}).get("kept_relation_count", 0)) for graph in graphs)
     report = [
-        "Innovation1 v3.1 Conservative Motif Extraction Report",
+        "Innovation1 v3.2 Sparse Motif Extraction Report",
         "=" * 72,
         f"Time: {timestamp()}",
         f"Parsed samples: {len(list(Path(parsed_dir).glob('*.pkl')))}",
@@ -526,9 +527,10 @@ def build_motif_graphs(workdir: str) -> Dict[str, Any]:
         f"Kept relation candidates: {kept_relations}",
         "",
         "Interpretation:",
-        "  v3.1 intentionally keeps a sparse motif graph.",
-        "  Orthogonal/parallel/opposite relations require local or overlap evidence.",
-        "  Adjacency is capped and treated as support, not the main innovation.",
+        "  v3.2 intentionally keeps a sparse motif graph.",
+        "  Orthogonal relations require real face adjacency.",
+        "  Parallel/opposite relations require high overlap and area-ratio evidence.",
+        "  Adjacency is only emitted around local features and is capped.",
         "  Motif nodes and relations are algorithm-extracted weak structural priors, not human labels.",
     ]
     if failures:
