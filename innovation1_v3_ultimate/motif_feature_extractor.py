@@ -639,7 +639,7 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
             is_smooth = False
             effective_absdot = absdot
             
-            # 优先使用基于网格中点距离最小化精确定位共享边的算法
+            # 【核心机制】优先使用基于网格中点距离最小化精确定位共享边的算法
             shared_norms = _get_shared_boundary_normals(i, j, face_wcs) if has_true_surface_sampling else None
             if shared_norms is not None:
                 ni_edge, nj_edge = shared_norms
@@ -647,27 +647,17 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                 is_smooth = (dot_val >= smooth_cos)
                 effective_absdot = dot_val
             else:
-                # 降级退回到旧有的边界面法向匹配。非平面对绝对不允许退化（否则圆柱面会在其分割缝线处产生大量误判）
-                if not is_plane_plane:
-                    is_smooth = False
+                # 降级时只允许两个解析平面使用解析法向进行平滑判定
+                both_analytical_planes = (
+                    is_plane_plane
+                    and fi.get("normal_source") == "analytical_plane"
+                    and fj.get("normal_source") == "analytical_plane"
+                )
+                if both_analytical_planes:
+                    is_smooth = (absdot >= smooth_cos)
+                    effective_absdot = absdot
                 else:
-                    b_norms_i = _get_boundary_normals(i, face_wcs)
-                    b_norms_j = _get_boundary_normals(j, face_wcs)
-                    
-                    if not b_norms_i and i < len(face_features):
-                        b_norms_i = [np.asarray(face_features[i]["normal_proxy"], dtype=np.float32)]
-                    if not b_norms_j and j < len(face_features):
-                        b_norms_j = [np.asarray(face_features[j]["normal_proxy"], dtype=np.float32)]
-                        
-                    if b_norms_i and b_norms_j:
-                        max_boundary_absdot = 0.0
-                        for ni_b in b_norms_i:
-                            for nj_b in b_norms_j:
-                                dot_val = abs(float(np.dot(ni_b, nj_b)))
-                                if dot_val > max_boundary_absdot:
-                                    max_boundary_absdot = dot_val
-                        is_smooth = (max_boundary_absdot >= smooth_cos)
-                        effective_absdot = max_boundary_absdot
+                    is_smooth = False
                 
             if is_smooth:
                 evidence = dict(base_evidence)
