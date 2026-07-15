@@ -62,12 +62,12 @@ $$\text{STEP B-Rep Solid} \xrightarrow{\text{多后端解析与清洗}} \text{pk
    * **边界标记 (Boundary Flag)**：面片 bbox 是否接触零件全局边界（容差为全局尺度的 2%）。
 2. **面对关系判定标准（阈值机制）**：
    * **`adjacent_to` (相邻)**：共享至少一条边（`face_adj[i, j] > 0`）。
-   * **`parallel_to` (平行)**：法向点积绝对值 $|N_i \cdot N_j| \ge \cos(12^\circ) \approx 0.978$。
-   * **`coplanar_with` (共面)**：已满足平行，且质心间距在法向上的投影（平面距离）满足：
-     $$\text{plane\_distance} = |(C_j - C_i) \cdot N_i| \le 0.015 \times \text{global\_scale}$$
-   * **`opposite_to` (相对)**：已满足平行，且法向投影间距 $\ge 0.015 \times \text{global\_scale}$，法向相反且中心分离。
-   * **`orthogonal_to` (正交)**：法向点积绝对值 $|N_i \cdot N_j| \le \sin(12^\circ) \approx 0.208$。
-   * **`smooth_connected` (平滑相连)**：已满足相邻，且法向夹角 $|N_i \cdot N_j| \ge \cos(18^\circ) \approx 0.951$，表示相切或小过渡。
+   * **`parallel_to` (平行)**：仅限于平面—平面，法向点积绝对值 $|N_i \cdot N_j| \ge \cos(0.1^\circ) \approx 0.999998$（即数学上完全平行）。
+   * **`coplanar_with` (共面)**：仅限于平面—平面，已满足平行，且平面精细投影距离满足：
+     $$\text{plane\_distance} = |(P_j - P_i) \cdot N_i| \le \max(10^{-4}, 10^{-5} \times \text{global\_scale})$$
+   * **`opposite_to` (相对)**：仅限于平面—平面，已满足平行，且平面投影有效间距满足 $\max(10^{-4}, 10^{-5} \times \text{global\_scale}) \le \text{effective\_gap} \le 0.15 \times \text{global\_scale}$，法向相反且双向对向投影积判定为实体材料填充。
+   * **`orthogonal_to` (正交)**：仅限于平面—平面，法向点积绝对值 $|N_i \cdot N_j| \le \sin(12^\circ) \approx 0.208$。
+   * **`smooth_connected` (平滑相连)**：已满足相邻，且法向夹角满足 $\ge \cos(18^\circ) \approx 0.951$，表示相切过渡。优先使用高精度共享边局部法向计算，在降级匹配中对非平面—平面限制退化，避免产生缝线处的过渡噪点。
 
 ---
 
@@ -86,14 +86,14 @@ $$\text{STEP B-Rep Solid} \xrightarrow{\text{多后端解析与清洗}} \text{pk
 * **`boundary_group` (零件外轮廓/边界组)**：
   * **算法**：面群中超过 $50\%$ 的面片接触到全局包围盒边界。
 * **`thin_wall_pair` (薄壁对)**：
-  * **算法**：在不同的 `face_group` 之间，寻找存在 `opposite_to` 关系的面对，要求它们面积比例 $\ge 0.62$，相对面积 $\ge 0.015$，且法向投影距离满足薄壁厚度截断：
-    $$\text{normal\_gap} \le \text{thin\_gap\_cut} = \max(10^{-5}, \min(0.08 \times \text{global\_scale}, 0.22 \times \text{major\_span}))$$
+  * **算法**：在不同的 `face_group` 之间，寻找存在 `opposite_to` 关系的面对，要求它们面积比例 $\ge 0.62$，相对面积 $\ge 0.015$，且投影重叠率有效（`projection_overlap_valid == True`），重叠率满足 `overlap >= 0.50`，且其精细有效平面间距满足薄壁厚度截断：
+    $$\text{effective\_gap} \le \text{thin\_gap\_cut} = \max(10^{-5}, \min(0.08 \times \text{global\_scale}, 0.22 \times \text{major\_span}))$$
 * **`loop_or_hole` (局部有界闭合环/孔洞候选)**：
   * **算法**：连通面群不处于全局边界上，面数 $\le 8$，且向外相邻的外部面群数量 $\ge 3$（形成包围围栏）。
 * **`transition_group` (几何过渡/圆角候选)**：
   * **算法**：面积小于截断值（默认 0.1），面片长宽比大（$\ge 3.0$）或呈高曲率，且至少连接了两个比其面积大 1.4 倍的外部面群。
 * **`repeated_feature` (重复特征簇)**：
-  * **算法**：对相对面积 $\le 0.35$ 且面积大于 0 的面群，通过特征特征签名匹配进行并查集聚类。两个面群相似的判定条件为：
+  * **算法**：对相对面积 $\le 0.35$ 且面积大于 0 的面群，通过特征特征签名匹配进行 complete-link 层次聚类。两个面群相似的判定条件为：
     $$\text{dims\_rel\_diff} \le 0.28 \land \text{area\_ratio} \ge 0.62 \land \text{normal\_absdot} \ge 0.92 \land \text{face\_count\_gap} \le 1 \land \text{degree\_gap} \le 2.5$$
   * **间距正则度计算 (`_spacing_regular_score`)**：对重复面群的质心矩阵执行 SVD 奇异值分解，提取第一主成分方差占比计算线性度 `linearity`。将质心投影到主成分方向并排序，计算相邻投影间距的变异系数 `spacing_cv`。最终输出正则排列得分：
     $$\text{regular\_score} = \text{linearity} \times (1.0 - \min(\text{spacing\_cv}, 1.0))$$
@@ -112,7 +112,7 @@ $$\text{STEP B-Rep Solid} \xrightarrow{\text{多后端解析与清洗}} \text{pk
 
 ---
 
-## 六、 结构图与先验蒸馏策略 (`S = D(M_raw)`)
+## 六、 结构图与先验蒸馏策略 (`S = D(M_c); M_c = C(M_raw)`)
 
 在构建完包含完整物理特征和支撑细节的 $M_{raw}$ 后，本模块设计了**蒸馏函数 (Distillation Function)**，将 $M_{raw}$ 蒸馏压缩为面向神经网络生成输入的高质量稀疏骨架 $S$。
 
