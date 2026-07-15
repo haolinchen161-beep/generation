@@ -1155,11 +1155,12 @@ def make_motif_prior_graph(graph: Dict[str, Any], raw_graph: Dict[str, Any] = No
                     }
 
     prior_relations_raw = _prune_prior_relations(list(relation_records.values()), len(selected_raw_nodes))
+    boundary_connection_types = {"bounded_by", "hosted_by"}
     connected_boundary_ids = {
-        str(rel.get(end))
+        str(rel.get(endpoint))
         for rel in prior_relations_raw
-        if str(rel.get("type")) == "bounded_by"
-        for end in ["source", "target"]
+        if str(rel.get("type")) in boundary_connection_types
+        for endpoint in ("source", "target")
     }
     pruned_nodes: List[Dict[str, Any]] = []
     for node in selected_raw_nodes:
@@ -1205,6 +1206,14 @@ def make_motif_prior_graph(graph: Dict[str, Any], raw_graph: Dict[str, Any] = No
         record["prior_role"] = "generation_prior_relation"
         prior_relations.append(record)
 
+    # 蒸馏图完整性检验，防止悬空节点或悬空边
+    prior_node_ids = {str(node["id"]) for node in prior_nodes}
+    for rel in prior_relations:
+        if rel["source"] not in prior_node_ids:
+            raise ValueError(f"dangling prior relation source: {rel}")
+        if rel["target"] not in prior_node_ids:
+            raise ValueError(f"dangling prior relation target: {rel}")
+
     prior_graph = copy.deepcopy(graph)
     prior_graph["graph_view"] = "distilled_motif_prior"
     prior_graph["prior_definition"] = "M_c = C(M_raw); S = D(M_c)"
@@ -1242,7 +1251,8 @@ def make_motif_prior_graph(graph: Dict[str, Any], raw_graph: Dict[str, Any] = No
         "version": "innovation1_v3_distilled_prior_v1",
         "policy": "distilled_sparse_generation_prior",
         "prior_symbol": "S",
-        "source_symbol": "M_raw",
+        "source_symbol": "M_c",
+        "source_raw_symbol": "M_raw",
         "node_type_vocab": NODE_TYPES,
         "relation_type_vocab": RELATION_TYPES,
         "motif_node_type_ids": [NODE_TYPES.index(node["type"]) for node in prior_nodes],
@@ -1250,14 +1260,15 @@ def make_motif_prior_graph(graph: Dict[str, Any], raw_graph: Dict[str, Any] = No
         "relation_role_vocab": ["structural", "support", "topology_support"],
         "motif_relation_role_ids": [0 for _ in prior_graph["motif_relations"]],
         "face_to_motif_nodes": face_to_prior_nodes,
-        "distillation_policy": "从 M_raw 中去除 face_group / embedded_in / adjacent_to 等支撑信息，仅保留可用于无条件生成的稀疏结构骨架 S。",
+        "distillation_policy": "先由 C(M_raw) 得到紧凑结构基元图 M_c，再由 D(M_c) 去除 face_group、embedded_in、adjacent_to 等支撑信息，得到用于生成网络的稀疏结构先验 S。",
     }
     prior_graph["motif_prior_distillation"] = {
-        "source_raw_node_count": len(raw_nodes),
-        "source_raw_relation_count": len(raw_relations),
-        "selected_raw_node_count": len(selected_raw_nodes),
-        "selected_prior_node_count": len(prior_nodes),
-        "selected_prior_relation_count": len(prior_graph["motif_relations"]),
+        "raw_graph_node_count": len(raw_nodes),
+        "raw_graph_relation_count": len(raw_relations),
+        "compact_graph_node_count": len(selected_raw_nodes),
+        "compact_graph_relation_count": len(prior_relations_raw),
+        "prior_node_count": len(prior_nodes),
+        "prior_relation_count": len(prior_graph["motif_relations"]),
         "kept_node_types": sorted(PRIOR_NODE_TYPES),
         "kept_relation_types": sorted(PRIOR_RELATION_TYPES),
         "dropped_default_node_types": ["face_group"],
@@ -1847,7 +1858,7 @@ def build_motif_graph(data: Dict[str, Any], raw_mode: bool = False) -> Dict[str,
         key = tuple(sorted([gid_i, gid_j]))
         if key in used_thin_pairs:
             continue
-        gap = float(evidence.get("normal_gap", 0.0))
+        gap = float(evidence.get("effective_gap", evidence.get("plane_distance", evidence.get("normal_gap", 0.0))))
         area_ratio = float(evidence.get("area_ratio_min_over_max", 0.0))
         group_a = face_group_by_id[key[0]]
         group_b = face_group_by_id[key[1]]
@@ -1859,7 +1870,14 @@ def build_motif_graph(data: Dict[str, Any], raw_mode: bool = False) -> Dict[str,
             float(group_a["features"].get("relative_area_sum", 0.0)),
             float(group_b["features"].get("relative_area_sum", 0.0)),
         )
-        overlap = float(evidence.get("projection_overlap_ratio", 1.0))
+        
+        # 严格校验重叠率：必须有效，且重叠率 >= 0.50
+        overlap_valid = bool(evidence.get("projection_overlap_valid", False))
+        overlap_value = evidence.get("projection_overlap_ratio")
+        if not overlap_valid or overlap_value is None:
+            continue
+        overlap = float(overlap_value)
+        
         if gap <= thin_gap_cut and area_ratio >= 0.62 and area_score >= 0.015 and overlap >= 0.50:
             gap_score = 1.0 - min(gap / max(thin_gap_cut, 1e-8), 1.0)
             confidence = float(0.42 + 0.30 * rel.get("confidence", 0.0) + 0.18 * area_ratio + 0.10 * gap_score)
@@ -1871,6 +1889,7 @@ def build_motif_graph(data: Dict[str, Any], raw_mode: bool = False) -> Dict[str,
                         "face_ids": sorted(set(group_a["face_ids"] + group_b["face_ids"])),
                         "pair_face_ids": [i, j],
                         "normal_gap": gap,
+                        "effective_gap": gap,
                         "thin_gap_cut": thin_gap_cut,
                         "area_ratio_min_over_max": area_ratio,
                         "opposite_relation": evidence,
@@ -1898,6 +1917,8 @@ def build_motif_graph(data: Dict[str, Any], raw_mode: bool = False) -> Dict[str,
                 "base_face_group_ids": list(key),
                 "pair_face_ids": item["pair_face_ids"],
                 "normal_gap": item["normal_gap"],
+                "effective_gap": item["effective_gap"],
+                "gap_source": "analytical_plane_distance",
                 "thin_gap_cut": item["thin_gap_cut"],
                 "area_ratio_min_over_max": item["area_ratio_min_over_max"],
             },
