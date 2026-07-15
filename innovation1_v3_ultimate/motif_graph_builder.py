@@ -1262,11 +1262,16 @@ def make_motif_prior_graph(graph: Dict[str, Any], raw_graph: Dict[str, Any] = No
         "face_to_motif_nodes": face_to_prior_nodes,
         "distillation_policy": "先由 C(M_raw) 得到紧凑结构基元图 M_c，再由 D(M_c) 去除 face_group、embedded_in、adjacent_to 等支撑信息，得到用于生成网络的稀疏结构先验 S。",
     }
+    raw_ref = raw_graph if raw_graph is not None else graph
+
     prior_graph["motif_prior_distillation"] = {
-        "raw_graph_node_count": len(raw_nodes),
-        "raw_graph_relation_count": len(raw_relations),
-        "compact_graph_node_count": len(selected_raw_nodes),
-        "compact_graph_relation_count": len(prior_relations_raw),
+        "raw_graph_node_count": len(raw_ref.get("motif_nodes", [])),
+        "raw_graph_relation_count": len(raw_ref.get("motif_relations", [])),
+        "compact_graph_node_count": len(raw_nodes),
+        "compact_graph_relation_count": len(raw_relations),
+        "selected_compact_node_count": len(selected_raw_nodes),
+        "preprune_prior_relation_count": len(relation_records),
+        "postprune_prior_relation_count": len(prior_relations_raw),
         "prior_node_count": len(prior_nodes),
         "prior_relation_count": len(prior_graph["motif_relations"]),
         "kept_node_types": sorted(PRIOR_NODE_TYPES),
