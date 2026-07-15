@@ -365,12 +365,6 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                     normal = analytical_normal / norm_an
                     has_analytical = True
                     normal_source = "analytical_plane"
-            elif face_type == 1:  # 圆柱 Cylinder
-                norm_an = float(np.linalg.norm(analytical_normal))
-                if norm_an > 1e-5:
-                    normal = analytical_normal / norm_an
-                    has_analytical = True
-                    normal_source = "analytical_surface_axis"
         
         if not has_analytical:
             if face_wcs.ndim >= 4 and fid < face_wcs.shape[0]:
@@ -473,13 +467,23 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
             plane_distance = float(abs(np.dot(np.asarray(pj) - np.asarray(pi), ni)))
         else:
             plane_distance = normal_gap
+
+        # 对于平面—平面关系，统一定义有效间距为精确平面距离
+        effective_gap = plane_distance if is_plane_plane else normal_gap
+        # 兼容原有特征提取，同时将有效间距覆盖为 normal_gap 供下游提取
+        normal_gap_val = effective_gap
+
         area_i = float(fi["area_proxy"])
         area_j = float(fj["area_proxy"])
         area_ratio = float(min(area_i, area_j) / max(max(area_i, area_j), 1e-8))
         
         # 计算基于面片 i PCA 主向投影的旋转不变投影重叠率
-        r_overlap = 1.0
+        projection_overlap_ratio = None
+        projection_overlap_valid = False
+        projection_overlap_source = "unavailable"
+        
         if absdot >= parallel_cos and is_plane_plane:
+            # 只有在平面且采样有效时执行计算
             if face_wcs is not None and face_wcs.ndim == 4:
                 if i < face_wcs.shape[0] and j < face_wcs.shape[0]:
                     try:
@@ -507,12 +511,18 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                         inter_dims = np.maximum(inter_max - inter_min, 0.0)
                         area_inter = inter_dims[0] * inter_dims[1]
                         
-                        area_i = (max_i[0] - min_i[0]) * (max_i[1] - min_i[1])
-                        area_j = (max_j[0] - min_j[0]) * (max_j[1] - min_j[1])
+                        area_i_proj = (max_i[0] - min_i[0]) * (max_i[1] - min_i[1])
+                        area_j_proj = (max_j[0] - min_j[0]) * (max_j[1] - min_j[1])
                         
-                        r_overlap = float(area_inter / max(min(area_i, area_j), 1e-8))
+                        if (np.isfinite(area_inter) and np.isfinite(area_i_proj) 
+                                and np.isfinite(area_j_proj) and min(area_i_proj, area_j_proj) > 1e-10):
+                            projection_overlap_ratio = float(np.clip(area_inter / min(area_i_proj, area_j_proj), 0.0, 1.0))
+                            projection_overlap_valid = True
+                            projection_overlap_source = "pca_projected_rectangle"
                     except Exception:
-                        r_overlap = 1.0
+                        projection_overlap_ratio = 0.0
+                        projection_overlap_valid = False
+                        projection_overlap_source = "calculation_failed"
 
         # 计算关系证据质量类别 (relation_evidence_quality)
         src_src = fi.get("normal_source", "pca")
@@ -534,12 +544,16 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
             "abs_normal_dot": absdot,
             "angle_to_parallel_deg": angle_to_parallel,
             "center_distance": center_distance,
-            "normal_gap": normal_gap,
+            "normal_gap": normal_gap_val,
+            "normal_gap_aabb_center": normal_gap,
             "plane_distance": plane_distance,
+            "effective_gap": effective_gap,
             "area_ratio_min_over_max": area_ratio,
             "shared_edges": int(shared_edges[i, j]),
             "relation_evidence_quality": relation_evidence_quality,
-            "projection_overlap_ratio": r_overlap,
+            "projection_overlap_ratio": projection_overlap_ratio,
+            "projection_overlap_valid": projection_overlap_valid,
+            "projection_overlap_source": projection_overlap_source,
         }
         
         type_i = int(face_types[i]) if i < len(face_types) else -1
@@ -580,12 +594,18 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                         "evidence": evidence,
                     }
                 )
-            if opposite_gap_min <= normal_gap <= 0.15 * global_scale and dot < 0 and np.dot(delta, ni) < 0:
+            # 实体薄壁 vs 空气空腔 双向有向外法向指向检查
+            facing_each_other = (
+                dot < 0.0
+                and float(np.dot(delta, ni)) < 0.0
+                and float(np.dot(-delta, nj)) < 0.0
+            )
+            if opposite_gap_min <= effective_gap <= 0.15 * global_scale and facing_each_other:
                 evidence = dict(base_evidence)
                 evidence["opposite_gap_min"] = opposite_gap_min
                 evidence["orientation_status"] = "法向相反"
                 confidence = 0.45 + 0.35 * _confidence_from_margin(absdot, 1.0, parallel_cos)
-                confidence += 0.15 * _confidence_from_margin(normal_gap, opposite_gap_min, 0.08 * global_scale, invert=True)
+                confidence += 0.15 * _confidence_from_margin(effective_gap, opposite_gap_min, 0.08 * global_scale, invert=True)
                 confidence += 0.05 * area_ratio
                 face_relations.append(
                     {
@@ -596,7 +616,7 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                         "evidence": evidence,
                     }
                 )
-        if abs(dot) <= ortho_sin:
+        if is_plane_plane and abs(dot) <= ortho_sin:
             evidence = dict(base_evidence)
             evidence["orthogonal_absdot_tol"] = ortho_sin
             face_relations.append(
@@ -620,24 +640,27 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
                 is_smooth = (dot_val >= smooth_cos)
                 effective_absdot = dot_val
             else:
-                # 降级退回到旧有的边界笛卡尔积最大夹角点积匹配
-                b_norms_i = _get_boundary_normals(i, face_wcs)
-                b_norms_j = _get_boundary_normals(j, face_wcs)
-                
-                if not b_norms_i and i < len(face_features):
-                    b_norms_i = [np.asarray(face_features[i]["normal_proxy"], dtype=np.float32)]
-                if not b_norms_j and j < len(face_features):
-                    b_norms_j = [np.asarray(face_features[j]["normal_proxy"], dtype=np.float32)]
+                # 降级退回到旧有的边界面法向匹配。非平面对绝对不允许退化（否则圆柱面会在其分割缝线处产生大量误判）
+                if not is_plane_plane:
+                    is_smooth = False
+                else:
+                    b_norms_i = _get_boundary_normals(i, face_wcs)
+                    b_norms_j = _get_boundary_normals(j, face_wcs)
                     
-                if b_norms_i and b_norms_j:
-                    max_boundary_absdot = 0.0
-                    for ni_b in b_norms_i:
-                        for nj_b in b_norms_j:
-                            dot_val = abs(float(np.dot(ni_b, nj_b)))
-                            if dot_val > max_boundary_absdot:
-                                max_boundary_absdot = dot_val
-                    is_smooth = (max_boundary_absdot >= smooth_cos)
-                    effective_absdot = max_boundary_absdot
+                    if not b_norms_i and i < len(face_features):
+                        b_norms_i = [np.asarray(face_features[i]["normal_proxy"], dtype=np.float32)]
+                    if not b_norms_j and j < len(face_features):
+                        b_norms_j = [np.asarray(face_features[j]["normal_proxy"], dtype=np.float32)]
+                        
+                    if b_norms_i and b_norms_j:
+                        max_boundary_absdot = 0.0
+                        for ni_b in b_norms_i:
+                            for nj_b in b_norms_j:
+                                dot_val = abs(float(np.dot(ni_b, nj_b)))
+                                if dot_val > max_boundary_absdot:
+                                    max_boundary_absdot = dot_val
+                        is_smooth = (max_boundary_absdot >= smooth_cos)
+                        effective_absdot = max_boundary_absdot
                 
             if is_smooth:
                 evidence = dict(base_evidence)
