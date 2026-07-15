@@ -114,7 +114,24 @@ def _indexed_shapes(shape: Any, shape_type: int) -> Tuple[Any, List[Any]]:
     return indexed, items
 
 
+def _canonicalize_axis(axis):
+    """规范化无向圆柱轴线方向向量，确保其主方向分量恒为正，保证特征提取的确定性。"""
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    if norm <= 1e-12:
+        return [0.0, 0.0, 0.0]
+    axis = axis / norm
+    major = int(np.argmax(np.abs(axis)))
+    if axis[major] < 0:
+        axis = -axis
+    return axis.tolist()
+
+
 def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """从输入 B-Rep 形状中安全提取 expected_face_count 数量面片的几何与曲面元数据特征。
+    
+    使用原子更新机制，保证当特定面片计算抛出异常时，全局 14 个元数据列表不会产生索引错位，并最终进行对齐校验。
+    """
     from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
     from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder
     from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
@@ -143,13 +160,31 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
 
     plane_type = int(GeomAbs_Plane)
     cyl_type = int(GeomAbs_Cylinder)
+    
     for face in faces[:expected_face_count]:
+        # 使用局部记录实现原子更新，确保即使提取失败，所有元数据列表均只追加一次
+        record = {
+            "surface_type": -1,
+            "curvature_proxy": 0.0,
+            "analytical_normal": [0.0, 0.0, 0.0],
+            "cylinder_radius": 0.0,
+            "cylinder_axis": [0.0, 0.0, 0.0],
+            "cylinder_location": [0.0, 0.0, 0.0],
+            "mean_curvature": 0.0,
+            "max_curvature": 0.0,
+            "var_curvature": 0.0,
+            "gaussian_sign": 0,
+            "plane_location": [0.0, 0.0, 0.0],
+            "plane_offset": 0.0,
+            "area_centroid": [0.0, 0.0, 0.0],
+            "face_area": 0.0,
+        }
         try:
             face_obj = topods.Face(face)
             adaptor = BRepAdaptor_Surface(face_obj, True)
             surf_type = int(adaptor.GetType())
-            surface_types.append(surf_type)
-            curvature_proxy.append(0.0 if surf_type == plane_type else 1.0)
+            record["surface_type"] = surf_type
+            record["curvature_proxy"] = 0.0 if surf_type == plane_type else 1.0
 
             # Area & Centroid
             area = 0.0
@@ -162,7 +197,8 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
                 area_centroid = [gp_g.X(), gp_g.Y(), gp_g.Z()]
             except Exception:
                 pass
-            face_areas.append(area)
+            record["face_area"] = area
+            record["area_centroid"] = area_centroid
 
             normal = [0.0, 0.0, 0.0]
             radius = 0.0
@@ -170,6 +206,7 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
             location = [0.0, 0.0, 0.0]
             plane_location = [0.0, 0.0, 0.0]
             plane_offset = 0.0
+            
             if surf_type == plane_type:
                 gp_pln = adaptor.Plane()
                 gp_loc = gp_pln.Location()
@@ -183,18 +220,24 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
                     normal_check = [-val for val in normal]
                 normal = normal_check
                 plane_offset = -float(np.dot(plane_location, normal))
+                
+                record["analytical_normal"] = normal
+                record["plane_location"] = plane_location
+                record["plane_offset"] = plane_offset
             elif surf_type == cyl_type:
                 gp_cyl = adaptor.Cylinder()
                 gp_dir = gp_cyl.Position().Direction()
-                normal = [gp_dir.X(), gp_dir.Y(), gp_dir.Z()]
+                # 圆柱轴向不根据 Orientation 进行正负翻转，轴线表示无向线，直接进行正规化以保证一致性
                 radius = float(gp_cyl.Radius())
-                axis = [gp_dir.X(), gp_dir.Y(), gp_dir.Z()]
+                axis = _canonicalize_axis([gp_dir.X(), gp_dir.Y(), gp_dir.Z()])
                 gp_loc = gp_cyl.Location()
                 location = [gp_loc.X(), gp_loc.Y(), gp_loc.Z()]
-            
-                if face_obj.Orientation() == TopAbs_REVERSED:
-                    normal = [-val for val in normal]
                 
+                record["analytical_normal"] = [0.0, 0.0, 0.0]  # 圆柱解析法向清空为 [0.0, 0.0, 0.0]
+                record["cylinder_radius"] = radius
+                record["cylinder_axis"] = axis
+                record["cylinder_location"] = location
+            
             # 计算微分几何曲率特征
             mean_curvs = []
             max_curvs = []
@@ -238,33 +281,30 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
                 var_c = 0.0
                 g_sign_avg = 0
                 
-            mean_curvatures.append(mean_c_avg)
-            max_curvatures.append(max_c_avg)
-            var_curvatures.append(var_c)
-            gaussian_signs.append(g_sign_avg)
-                
-            analytical_normals.append(normal)
-            cylinder_radii.append(radius)
-            cylinder_axes.append(axis)
-            cylinder_locations.append(location)
-            face_plane_locations.append(plane_location)
-            face_plane_offsets.append(plane_offset)
-            face_area_centroids.append(area_centroid)
+            record["mean_curvature"] = mean_c_avg
+            record["max_curvature"] = max_c_avg
+            record["var_curvature"] = var_c
+            record["gaussian_sign"] = g_sign_avg
         except Exception:
-            surface_types.append(-1)
-            curvature_proxy.append(0.0)
-            analytical_normals.append([0.0, 0.0, 0.0])
-            cylinder_radii.append(0.0)
-            cylinder_axes.append([0.0, 0.0, 0.0])
-            cylinder_locations.append([0.0, 0.0, 0.0])
-            mean_curvatures.append(0.0)
-            max_curvatures.append(0.0)
-            var_curvatures.append(0.0)
-            gaussian_signs.append(0)
-            face_plane_locations.append([0.0, 0.0, 0.0])
-            face_plane_offsets.append(0.0)
-            face_area_centroids.append([0.0, 0.0, 0.0])
-            face_areas.append(0.0)
+            pass
+
+        # 统一追加一次，确保 14 个全局数组长度完全一致
+        surface_types.append(record["surface_type"])
+        curvature_proxy.append(record["curvature_proxy"])
+        analytical_normals.append(record["analytical_normal"])
+        cylinder_radii.append(record["cylinder_radius"])
+        cylinder_axes.append(record["cylinder_axis"])
+        cylinder_locations.append(record["cylinder_location"])
+        mean_curvatures.append(record["mean_curvature"])
+        max_curvatures.append(record["max_curvature"])
+        var_curvatures.append(record["var_curvature"])
+        gaussian_signs.append(record["gaussian_sign"])
+        face_plane_locations.append(record["plane_location"])
+        face_plane_offsets.append(record["plane_offset"])
+        face_area_centroids.append(record["area_centroid"])
+        face_areas.append(record["face_area"])
+
+    # 数组对齐与补齐逻辑，补足至 expected_face_count 长度以适配下游神经网络输入维度
     while len(surface_types) < expected_face_count:
         surface_types.append(-1)
         curvature_proxy.append(0.0)
@@ -280,6 +320,31 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
         face_plane_offsets.append(0.0)
         face_area_centroids.append([0.0, 0.0, 0.0])
         face_areas.append(0.0)
+
+    # 强制长度和维度的强一致性校验
+    metadata_arrays = {
+        "surface_types": surface_types,
+        "curvature_proxy": curvature_proxy,
+        "analytical_normals": analytical_normals,
+        "cylinder_radii": cylinder_radii,
+        "cylinder_axes": cylinder_axes,
+        "cylinder_locations": cylinder_locations,
+        "mean_curvatures": mean_curvatures,
+        "max_curvatures": max_curvatures,
+        "var_curvatures": var_curvatures,
+        "gaussian_signs": gaussian_signs,
+        "face_plane_locations": face_plane_locations,
+        "face_plane_offsets": face_plane_offsets,
+        "face_area_centroids": face_area_centroids,
+        "face_areas": face_areas,
+    }
+    for name, values in metadata_arrays.items():
+        if len(values) != expected_face_count:
+            raise BrepParseError(
+                "surface_metadata_length_mismatch",
+                f"{name}: expected={expected_face_count}, actual={len(values)}",
+            )
+
     return (
         np.asarray(surface_types, dtype=np.int64),
         np.asarray(curvature_proxy, dtype=np.float32),
@@ -296,7 +361,6 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
         np.asarray(face_area_centroids, dtype=np.float32),
         np.asarray(face_areas, dtype=np.float32)
     )
-
 
 def _parse_step_occ_fallback(step_path: str) -> Dict[str, Any]:
     try:
@@ -421,6 +485,10 @@ def _parse_step_occ_fallback(step_path: str) -> Dict[str, Any]:
 
 
 def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """从已拆分的 solid 拓扑实体中，按 face_idx 顺序提取各面片的几何与曲面元数据特征。
+    
+    使用原子更新机制，保证当特定面片计算抛出异常时，全局 14 个元数据列表不会产生索引错位，并最终进行对齐校验。
+    """
     from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
     from OCC.Core.TopoDS import topods
     from occwl.entity_mapper import EntityMapper
@@ -463,10 +531,27 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
     face_count = len(dict_new)
     for i in range(face_count):
         face = dict_new[i]
+        # 使用局部记录实现原子更新，确保即使提取失败，所有元数据列表均只追加一次
+        record = {
+            "surface_type": -1,
+            "curvature_proxy": 0.0,
+            "analytical_normal": [0.0, 0.0, 0.0],
+            "cylinder_radius": 0.0,
+            "cylinder_axis": [0.0, 0.0, 0.0],
+            "cylinder_location": [0.0, 0.0, 0.0],
+            "mean_curvature": 0.0,
+            "max_curvature": 0.0,
+            "var_curvature": 0.0,
+            "gaussian_sign": 0,
+            "plane_location": [0.0, 0.0, 0.0],
+            "plane_offset": 0.0,
+            "area_centroid": [0.0, 0.0, 0.0],
+            "face_area": 0.0,
+        }
         try:
             enum_val = int(face.surface_type_enum())
-            surface_types.append(enum_val)
-            curvature_proxy.append(0.0 if enum_val == 0 else 1.0)
+            record["surface_type"] = enum_val
+            record["curvature_proxy"] = 0.0 if enum_val == 0 else 1.0
             
             topo_face = topods.Face(face.topods_shape())
             adaptor = BRepAdaptor_Surface(topo_face, True)
@@ -482,7 +567,8 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
                 area_centroid = [gp_g.X(), gp_g.Y(), gp_g.Z()]
             except Exception:
                 pass
-            face_areas.append(area)
+            record["face_area"] = area
+            record["area_centroid"] = area_centroid
             
             normal = [0.0, 0.0, 0.0]
             radius = 0.0
@@ -506,17 +592,23 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
                         normal_check = [-val for val in normal]
                     normal = normal_check
                     plane_offset = -float(np.dot(plane_location, normal))
+                    
+                    record["analytical_normal"] = normal
+                    record["plane_location"] = plane_location
+                    record["plane_offset"] = plane_offset
                 else:
                     gp_cyl = adaptor.Cylinder()
                     gp_dir = gp_cyl.Position().Direction()
-                    normal = [gp_dir.X(), gp_dir.Y(), gp_dir.Z()]
+                    # 圆柱轴向不根据 Orientation 进行正负翻转，轴线表示无向线，直接进行正规化以保证一致性
                     radius = float(gp_cyl.Radius())
-                    axis = [gp_dir.X(), gp_dir.Y(), gp_dir.Z()]
+                    axis = _canonicalize_axis([gp_dir.X(), gp_dir.Y(), gp_dir.Z()])
                     gp_loc = gp_cyl.Location()
                     location = [gp_loc.X(), gp_loc.Y(), gp_loc.Z()]
-                    from OCC.Core.TopAbs import TopAbs_REVERSED
-                    if topo_face.Orientation() == TopAbs_REVERSED:
-                        normal = [-val for val in normal]
+                    
+                    record["analytical_normal"] = [0.0, 0.0, 0.0]  # 圆柱解析法向清空为 [0.0, 0.0, 0.0]
+                    record["cylinder_radius"] = radius
+                    record["cylinder_axis"] = axis
+                    record["cylinder_location"] = location
             
             # 计算微分几何曲率特征
             mean_curvs = []
@@ -562,33 +654,52 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
                 var_c = 0.0
                 g_sign_avg = 0
                 
-            mean_curvatures.append(mean_c_avg)
-            max_curvatures.append(max_c_avg)
-            var_curvatures.append(var_c)
-            gaussian_signs.append(g_sign_avg)
-            
-            analytical_normals.append(normal)
-            cylinder_radii.append(radius)
-            cylinder_axes.append(axis)
-            cylinder_locations.append(location)
-            face_plane_locations.append(plane_location)
-            face_plane_offsets.append(plane_offset)
-            face_area_centroids.append(area_centroid)
+            record["mean_curvature"] = mean_c_avg
+            record["max_curvature"] = max_c_avg
+            record["var_curvature"] = var_c
+            record["gaussian_sign"] = g_sign_avg
         except Exception:
-            surface_types.append(-1)
-            curvature_proxy.append(0.0)
-            analytical_normals.append([0.0, 0.0, 0.0])
-            cylinder_radii.append(0.0)
-            cylinder_axes.append([0.0, 0.0, 0.0])
-            cylinder_locations.append([0.0, 0.0, 0.0])
-            mean_curvatures.append(0.0)
-            max_curvatures.append(0.0)
-            var_curvatures.append(0.0)
-            gaussian_signs.append(0)
-            face_plane_locations.append([0.0, 0.0, 0.0])
-            face_plane_offsets.append(0.0)
-            face_area_centroids.append([0.0, 0.0, 0.0])
-            face_areas.append(0.0)
+            pass
+            
+        # 统一追加一次，确保 14 个全局数组长度完全一致
+        surface_types.append(record["surface_type"])
+        curvature_proxy.append(record["curvature_proxy"])
+        analytical_normals.append(record["analytical_normal"])
+        cylinder_radii.append(record["cylinder_radius"])
+        cylinder_axes.append(record["cylinder_axis"])
+        cylinder_locations.append(record["cylinder_location"])
+        mean_curvatures.append(record["mean_curvature"])
+        max_curvatures.append(record["max_curvature"])
+        var_curvatures.append(record["var_curvature"])
+        gaussian_signs.append(record["gaussian_sign"])
+        face_plane_locations.append(record["plane_location"])
+        face_plane_offsets.append(record["plane_offset"])
+        face_area_centroids.append(record["area_centroid"])
+        face_areas.append(record["face_area"])
+
+    # 强制长度和维度的强一致性校验
+    metadata_arrays = {
+        "surface_types": surface_types,
+        "curvature_proxy": curvature_proxy,
+        "analytical_normals": analytical_normals,
+        "cylinder_radii": cylinder_radii,
+        "cylinder_axes": cylinder_axes,
+        "cylinder_locations": cylinder_locations,
+        "mean_curvatures": mean_curvatures,
+        "max_curvatures": max_curvatures,
+        "var_curvatures": var_curvatures,
+        "gaussian_signs": gaussian_signs,
+        "face_plane_locations": face_plane_locations,
+        "face_plane_offsets": face_plane_offsets,
+        "face_area_centroids": face_area_centroids,
+        "face_areas": face_areas,
+    }
+    for name, values in metadata_arrays.items():
+        if len(values) != face_count:
+            raise BrepParseError(
+                "surface_metadata_length_mismatch",
+                f"{name}: expected={face_count}, actual={len(values)}",
+            )
             
     return (
         np.asarray(surface_types, dtype=np.int64),
@@ -606,7 +717,6 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
         np.asarray(face_area_centroids, dtype=np.float32),
         np.asarray(face_areas, dtype=np.float32)
     )
-
 
 def _parse_step_dtg(step_path: str) -> Dict[str, Any]:
     try:
