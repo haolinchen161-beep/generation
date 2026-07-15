@@ -254,6 +254,8 @@ def _confidence_from_margin(value: float, good: float, bad: float, invert: bool 
 
 
 def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
+    sampling_quality = str(data.get("geometry_sampling_quality", "unknown"))
+    has_true_surface_sampling = (sampling_quality == "true_or_dtg_sampling")
     face_bbox = _face_bboxes(data)
     face_count = int(data.get("face_count", face_bbox.shape[0]))
     face_bbox = face_bbox[:face_count]
@@ -483,46 +485,51 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
         projection_overlap_source = "unavailable"
         
         if absdot >= parallel_cos and is_plane_plane:
-            # 只有在平面且采样有效时执行计算
-            if face_wcs is not None and face_wcs.ndim == 4:
-                if i < face_wcs.shape[0] and j < face_wcs.shape[0]:
-                    try:
-                        grid_i = face_wcs[i]
-                        grid_j = face_wcs[j]
-                        pts_i = grid_i.reshape(-1, 3)
-                        pts_j = grid_j.reshape(-1, 3)
-                        
-                        center_i = np.mean(pts_i, axis=0)
-                        cov_i = np.cov(pts_i.T)
-                        evals, evecs = np.linalg.eigh(cov_i)
-                        e1 = evecs[:, 1]
-                        e2 = evecs[:, 2]
-                        
-                        proj_i = np.stack([np.dot(pts_i - center_i, e1), np.dot(pts_i - center_i, e2)], axis=-1)
-                        proj_j = np.stack([np.dot(pts_j - center_i, e1), np.dot(pts_j - center_i, e2)], axis=-1)
-                        
-                        min_i = np.min(proj_i, axis=0)
-                        max_i = np.max(proj_i, axis=0)
-                        min_j = np.min(proj_j, axis=0)
-                        max_j = np.max(proj_j, axis=0)
-                        
-                        inter_min = np.maximum(min_i, min_j)
-                        inter_max = np.minimum(max_i, max_j)
-                        inter_dims = np.maximum(inter_max - inter_min, 0.0)
-                        area_inter = inter_dims[0] * inter_dims[1]
-                        
-                        area_i_proj = (max_i[0] - min_i[0]) * (max_i[1] - min_i[1])
-                        area_j_proj = (max_j[0] - min_j[0]) * (max_j[1] - min_j[1])
-                        
-                        if (np.isfinite(area_inter) and np.isfinite(area_i_proj) 
-                                and np.isfinite(area_j_proj) and min(area_i_proj, area_j_proj) > 1e-10):
-                            projection_overlap_ratio = float(np.clip(area_inter / min(area_i_proj, area_j_proj), 0.0, 1.0))
-                            projection_overlap_valid = True
-                            projection_overlap_source = "pca_projected_rectangle"
-                    except Exception:
-                        projection_overlap_ratio = 0.0
-                        projection_overlap_valid = False
-                        projection_overlap_source = "calculation_failed"
+            if not has_true_surface_sampling:
+                projection_overlap_ratio = None
+                projection_overlap_valid = False
+                projection_overlap_source = "sampling_quality_insufficient"
+            else:
+                # 只有在平面且采样有效时执行计算
+                if face_wcs is not None and face_wcs.ndim == 4:
+                    if i < face_wcs.shape[0] and j < face_wcs.shape[0]:
+                        try:
+                            grid_i = face_wcs[i]
+                            grid_j = face_wcs[j]
+                            pts_i = grid_i.reshape(-1, 3)
+                            pts_j = grid_j.reshape(-1, 3)
+                            
+                            center_i = np.mean(pts_i, axis=0)
+                            cov_i = np.cov(pts_i.T)
+                            evals, evecs = np.linalg.eigh(cov_i)
+                            e1 = evecs[:, 1]
+                            e2 = evecs[:, 2]
+                            
+                            proj_i = np.stack([np.dot(pts_i - center_i, e1), np.dot(pts_i - center_i, e2)], axis=-1)
+                            proj_j = np.stack([np.dot(pts_j - center_i, e1), np.dot(pts_j - center_i, e2)], axis=-1)
+                            
+                            min_i = np.min(proj_i, axis=0)
+                            max_i = np.max(proj_i, axis=0)
+                            min_j = np.min(proj_j, axis=0)
+                            max_j = np.max(proj_j, axis=0)
+                            
+                            inter_min = np.maximum(min_i, min_j)
+                            inter_max = np.minimum(max_i, max_j)
+                            inter_dims = np.maximum(inter_max - inter_min, 0.0)
+                            area_inter = inter_dims[0] * inter_dims[1]
+                            
+                            area_i_proj = (max_i[0] - min_i[0]) * (max_i[1] - min_i[1])
+                            area_j_proj = (max_j[0] - min_j[0]) * (max_j[1] - min_j[1])
+                            
+                            if (np.isfinite(area_inter) and np.isfinite(area_i_proj) 
+                                    and np.isfinite(area_j_proj) and min(area_i_proj, area_j_proj) > 1e-10):
+                                projection_overlap_ratio = float(np.clip(area_inter / min(area_i_proj, area_j_proj), 0.0, 1.0))
+                                projection_overlap_valid = True
+                                projection_overlap_source = "pca_projected_rectangle"
+                        except Exception:
+                            projection_overlap_ratio = 0.0
+                            projection_overlap_valid = False
+                            projection_overlap_source = "calculation_failed"
 
         # 计算关系证据质量类别 (relation_evidence_quality)
         src_src = fi.get("normal_source", "pca")
@@ -633,7 +640,7 @@ def extract_motif_features(data: Dict[str, Any]) -> Dict[str, Any]:
             effective_absdot = absdot
             
             # 优先使用基于网格中点距离最小化精确定位共享边的算法
-            shared_norms = _get_shared_boundary_normals(i, j, face_wcs)
+            shared_norms = _get_shared_boundary_normals(i, j, face_wcs) if has_true_surface_sampling else None
             if shared_norms is not None:
                 ni_edge, nj_edge = shared_norms
                 dot_val = abs(float(np.dot(ni_edge, nj_edge)))
