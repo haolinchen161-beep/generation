@@ -9,10 +9,22 @@
 在公共 CAD 数据集（如 ABC 和 DeepCAD）中，模型不包含如航空复材或特定机械装配的领域语义标签（例如没有 `panel`、`stiffener`、`flange` 等）。本模块放弃了强行拟合领域特定语义的做法，而是提出**无领域限制的“弱结构基元”提取理论**，从纯几何拓扑角度提炼零件的通用几何设计意图。
 
 本模块的核心数据处理链路为：
-$$\text{STEP B-Rep Solid} \xrightarrow{\text{多后端解析与清洗}} E_{face} (\text{pkl 缓存}) \xrightarrow{\text{证据提取}} M_{raw} \xrightarrow{\text{图紧凑化 } C} M_c \xrightarrow{\text{先验蒸馏 } D} S$$
+$$
+\text{STEP B-Rep Solid}
+\xrightarrow{\text{多后端解析与清洗}}
+B_{\mathrm{cache}}\;(\text{pkl 拓扑几何缓存})
+\xrightarrow{\text{面级证据计算}}
+E_{\mathrm{face}}
+\xrightarrow{\text{基元聚合}}
+M_{\mathrm{raw}}
+\xrightarrow{C}
+M_c
+\xrightarrow{D}
+S
+$$
 
 1. **$M_{raw}$ (完整弱结构证据图)**：包含零件中所有的几何基元、面群、孔洞/圆角/薄壁候选以及面与面、群与群之间的拓扑、空间支撑、几何关系。作为审计、统计、可视化和可解释分析的证据全集。
-2. **$M_c$ (紧凑结构基元图)**：由 $M_{raw}$ 经紧凑化函数 $C(M_{raw})$ 过滤并合并，限制节点预算与支撑关系得到。
+2. **$M_c$ (紧凑结构基元图)**：由 $M_{raw}$ 经节点筛选、关系裁剪、支撑压缩与统一重映射得到。
 3. **$S$ (生成先验图)**：由 $M_c$ 经蒸馏函数 $D(M_c)$ 过滤得到。只保留核心结构节点与平行、相对、共面等**强结构边**，去除密集的支撑与局部拓扑边，作为生成网络学习的稀疏结构骨架。
 
 ---
