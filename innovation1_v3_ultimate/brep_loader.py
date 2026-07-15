@@ -130,7 +130,7 @@ def _canonicalize_axis(axis):
 def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """从输入 B-Rep 形状中安全提取 expected_face_count 数量面片的几何与曲面元数据特征。
     
-    使用原子更新机制，保证当特定面片计算抛出异常时，全局 14 个元数据列表不会产生索引错位，并最终进行对齐校验。
+    【核心机制】使用原子更新机制，保证当特定面片计算抛出异常时，全局 14 个元数据列表不会产生索引错位，并最终进行对齐校验。
     """
     from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
     from OCC.Core.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder
