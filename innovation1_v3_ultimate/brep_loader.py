@@ -127,6 +127,26 @@ def _canonicalize_axis(axis):
     return axis.tolist()
 
 
+def _empty_surface_record():
+    """返回空/默认的曲面元数据特征记录字典，用于异常时重置特征保证原子性。"""
+    return {
+        "surface_type": -1,
+        "curvature_proxy": 0.0,
+        "analytical_normal": [0.0, 0.0, 0.0],
+        "cylinder_radius": 0.0,
+        "cylinder_axis": [0.0, 0.0, 0.0],
+        "cylinder_location": [0.0, 0.0, 0.0],
+        "mean_curvature": 0.0,
+        "max_curvature": 0.0,
+        "var_curvature": 0.0,
+        "gaussian_sign": 0,
+        "plane_location": [0.0, 0.0, 0.0],
+        "plane_offset": 0.0,
+        "area_centroid": [0.0, 0.0, 0.0],
+        "face_area": 0.0,
+    }
+
+
 def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """从输入 B-Rep 形状中安全提取 expected_face_count 数量面片的几何与曲面元数据特征。
     
@@ -163,22 +183,7 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
     
     for face in faces[:expected_face_count]:
         # 使用局部记录实现原子更新，确保即使提取失败，所有元数据列表均只追加一次
-        record = {
-            "surface_type": -1,
-            "curvature_proxy": 0.0,
-            "analytical_normal": [0.0, 0.0, 0.0],
-            "cylinder_radius": 0.0,
-            "cylinder_axis": [0.0, 0.0, 0.0],
-            "cylinder_location": [0.0, 0.0, 0.0],
-            "mean_curvature": 0.0,
-            "max_curvature": 0.0,
-            "var_curvature": 0.0,
-            "gaussian_sign": 0,
-            "plane_location": [0.0, 0.0, 0.0],
-            "plane_offset": 0.0,
-            "area_centroid": [0.0, 0.0, 0.0],
-            "face_area": 0.0,
-        }
+        record = _empty_surface_record()
         try:
             face_obj = topods.Face(face)
             adaptor = BRepAdaptor_Surface(face_obj, True)
@@ -286,7 +291,7 @@ def _surface_metadata_from_shape(shape: Any, expected_face_count: int) -> Tuple[
             record["var_curvature"] = var_c
             record["gaussian_sign"] = g_sign_avg
         except Exception:
-            pass
+            record = _empty_surface_record()
 
         # 统一追加一次，确保 14 个全局数组长度完全一致
         surface_types.append(record["surface_type"])
@@ -532,22 +537,7 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
     for i in range(face_count):
         face = dict_new[i]
         # 使用局部记录实现原子更新，确保即使提取失败，所有元数据列表均只追加一次
-        record = {
-            "surface_type": -1,
-            "curvature_proxy": 0.0,
-            "analytical_normal": [0.0, 0.0, 0.0],
-            "cylinder_radius": 0.0,
-            "cylinder_axis": [0.0, 0.0, 0.0],
-            "cylinder_location": [0.0, 0.0, 0.0],
-            "mean_curvature": 0.0,
-            "max_curvature": 0.0,
-            "var_curvature": 0.0,
-            "gaussian_sign": 0,
-            "plane_location": [0.0, 0.0, 0.0],
-            "plane_offset": 0.0,
-            "area_centroid": [0.0, 0.0, 0.0],
-            "face_area": 0.0,
-        }
+        record = _empty_surface_record()
         try:
             enum_val = int(face.surface_type_enum())
             record["surface_type"] = enum_val
@@ -659,7 +649,7 @@ def _extract_surface_types_from_split_solid(split_solid: Any) -> Tuple[np.ndarra
             record["var_curvature"] = var_c
             record["gaussian_sign"] = g_sign_avg
         except Exception:
-            pass
+            record = _empty_surface_record()
             
         # 统一追加一次，确保 14 个全局数组长度完全一致
         surface_types.append(record["surface_type"])
