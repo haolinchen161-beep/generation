@@ -1,15 +1,18 @@
-"""Data preprocessing and feature extraction for PriorFaceBbox.
+"""Data preprocessing and feature extraction for PriorFaceBbox (v6).
 
-Refactored extract_motif_node_graph according to Core Directives 1, 2, 3, 5:
-- Preserves 3D motif_instance [B, N_faces, 3] (sheet, hole, repeat channels) without argmax!
-- Constructs multi-hot face_to_node assignment matrix [B, N_faces, 32] (a face can belong to multiple nodes).
-- Includes Node 0 as permanent Background/Null Node (node_mask[:, 0] = True) to prevent NaN in MultiheadAttention.
-- Uses motif_confidence for node features.
-- Row-normalizes relation adjacencies (hosted_adj, thin_wall_adj).
+Implements Core Directives 1, 3, 5, 6:
+- max_nodes = 64 with explicit overflow warning.
+- Node 0 = Permanent Background Node (node_mask[:, 0] = True, node_roles[:, 0] = -1).
+- Returns node_roles [B, 64] (-1: background, 0: sheet, 1: hole, 2: repeat).
+- Type-constrained relation graph:
+  - hosted_by: only local_node (hole/repeat) -> sheet_node.
+  - thin_wall_pair: only sheet_node <-> sheet_node.
+- Row-normalized relation adjacencies.
 """
 
 from __future__ import annotations
 
+import warnings
 import torch
 import torch.nn.functional as F
 from typing import Dict, Any, Tuple
@@ -64,16 +67,17 @@ def extract_global_prior_features(prior_dict: Dict[str, torch.Tensor]) -> torch.
 
 def extract_motif_node_graph(
     prior_dict: Dict[str, torch.Tensor],
-    max_nodes: int = 32,
+    max_nodes: int = 64,
 ) -> Dict[str, torch.Tensor]:
-    """Core Directives 1, 2, 3, 5: Construct Motif Graph Nodes with Background Node & Multi-Hot Assignment.
+    """Core Directives 1, 2, 3, 5, 6: Construct Motif Graph Nodes with Background Node & Type-Constrained Edges.
 
-    Node 0: Permanent Background Node (node_mask[:, 0] = True).
+    Node 0: Permanent Background Node (node_mask[:, 0] = True, node_roles[:, 0] = -1).
     Nodes 1..max_nodes-1: Real Motif Instance Nodes (channel, instance_id).
 
     Returns:
       node_features:     [B, max_nodes, 11]
       node_mask:         [B, max_nodes] (bool, node 0 always True)
+      node_roles:        [B, max_nodes] (long: -1=background, 0=sheet, 1=hole, 2=repeat)
       assignment_target: [B, N_faces, max_nodes] (multi-hot, float)
       hosted_adj:        [B, max_nodes, max_nodes] (row-normalized)
       thin_wall_adj:     [B, max_nodes, max_nodes] (row-normalized)
@@ -85,7 +89,6 @@ def extract_motif_node_graph(
     stype = prior_dict["surface_type"].long().clamp(0, 5)  # [b, max_faces]
     stype_oh = F.one_hot(stype, num_classes=6).float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 6]
 
-    # Use motif_confidence if available, fallback to surface_confidence
     if "motif_confidence" in prior_dict:
         mconf = prior_dict["motif_confidence"].float()
         if mconf.ndim == 2:
@@ -94,7 +97,7 @@ def extract_motif_node_graph(
         mconf = prior_dict["surface_confidence"].float().unsqueeze(-1)  # [b, max_faces, 1]
 
     mmem = prior_dict["motif_membership"].float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 3]
-    minst = prior_dict["motif_instance"] if "motif_instance" in prior_dict else torch.zeros_like(mmem)  # [b, max_faces, 3] or [b, max_faces]
+    minst = prior_dict["motif_instance"] if "motif_instance" in prior_dict else torch.zeros_like(mmem)
 
     if minst.ndim == 2:
         minst = minst.unsqueeze(-1)  # [b, max_faces, 1]
@@ -103,15 +106,15 @@ def extract_motif_node_graph(
 
     node_features_list = []
     node_mask_list = []
+    node_roles_list = []
     assignment_list = []
     hosted_adj_list = []
     thin_wall_adj_list = []
 
     for b in range(batch_size):
-        # Node 0 is reserved for background node
+        # Node 0 is reserved for background node (role = -1)
         node_dicts = [{"key": "background", "role": -1, "faces": []}]
 
-        # Collect instance nodes across 3 channels (0: sheet, 1: hole, 2: repeat)
         valid_faces = torch.where(face_mask[b])[0].tolist()
 
         for f_idx in valid_faces:
@@ -127,25 +130,30 @@ def extract_motif_node_graph(
                             break
                     if not found and len(node_dicts) < max_nodes:
                         node_dicts.append({"key": group_key, "role": ch, "faces": [f_idx]})
+                    elif not found and len(node_dicts) >= max_nodes:
+                        warnings.warn(f"Sample {b}: Node count exceeds max_nodes ({max_nodes})! Node truncation triggered.")
 
         num_nodes = len(node_dicts)
 
         nf = torch.zeros((max_nodes, 11), device=device)
         nm = torch.zeros((max_nodes,), dtype=torch.bool, device=device)
+        nr = torch.full((max_nodes,), -1, dtype=torch.long, device=device)
         asgn = torch.zeros((max_faces, max_nodes), device=device)
         ha = torch.zeros((max_nodes, max_nodes), device=device)
         ta = torch.zeros((max_nodes, max_nodes), device=device)
 
         # Background node 0 is ALWAYS valid
         nm[0] = True
-        nf[0, :] = 0.0  # background features
+        nr[0] = -1
+        nf[0, :] = 0.0
 
-        # For faces that belong to no motif node, assign them to background node 0
         assigned_faces = set()
         for n_idx in range(1, num_nodes):
             nd = node_dicts[n_idx]
             f_list = nd["faces"]
             nm[n_idx] = True
+            nr[n_idx] = nd["role"]
+
             for f in f_list:
                 asgn[f, n_idx] = 1.0
                 assigned_faces.add(f)
@@ -163,7 +171,7 @@ def extract_motif_node_graph(
             if f not in assigned_faces:
                 asgn[f, 0] = 1.0  # Assign unassigned faces to Background Node 0
 
-        # Relation Adjacencies
+        # Pair relations with TYPE CONSTRAINTS
         if pair_rel.shape[-1] >= 1:
             rel_h = pair_rel[b, :, :, 0]
         else:
@@ -174,21 +182,28 @@ def extract_motif_node_graph(
         else:
             rel_t = torch.zeros((max_faces, max_faces), device=device)
 
-        # Aggregate face-level relations to node-level
         for n1 in range(1, num_nodes):
+            r1 = node_dicts[n1]["role"]
             f1_list = node_dicts[n1]["faces"]
             for n2 in range(1, num_nodes):
                 if n1 == n2:
                     continue
+                r2 = node_dicts[n2]["role"]
                 f2_list = node_dicts[n2]["faces"]
-                h_sum = rel_h[f1_list][:, f2_list].sum().item()
-                t_sum = rel_t[f1_list][:, f2_list].sum().item()
-                if h_sum > 0:
-                    ha[n1, n2] = float(h_sum)
-                if t_sum > 0:
-                    ta[n1, n2] = float(t_sum)
 
-        # Row normalization for relation adjacencies
+                # hosted_by: ONLY allow local_node (r1=1:hole, r2=2:repeat) -> sheet_node (r2=0)
+                if (r1 in (1, 2)) and (r2 == 0):
+                    h_sum = rel_h[f1_list][:, f2_list].sum().item()
+                    if h_sum > 0:
+                        ha[n1, n2] = float(h_sum)
+
+                # thin_wall_pair: ONLY allow sheet_node (r1=0) <-> sheet_node (r2=0)
+                if (r1 == 0) and (r2 == 0):
+                    t_sum = rel_t[f1_list][:, f2_list].sum().item()
+                    if t_sum > 0:
+                        ta[n1, n2] = float(t_sum)
+
+        # Row normalization
         ha_denom = ha.sum(dim=-1, keepdim=True).clamp_min(1.0)
         ta_denom = ta.sum(dim=-1, keepdim=True).clamp_min(1.0)
         ha = ha / ha_denom
@@ -196,14 +211,16 @@ def extract_motif_node_graph(
 
         node_features_list.append(nf)
         node_mask_list.append(nm)
+        node_roles_list.append(nr)
         assignment_list.append(asgn)
         hosted_adj_list.append(ha)
         thin_wall_adj_list.append(ta)
 
     return {
         "node_features": torch.stack(node_features_list, dim=0),  # [B, max_nodes, 11]
-        "node_mask": torch.stack(node_mask_list, dim=0),  # [B, max_nodes]
+        "node_mask": torch.stack(node_mask_list, dim=0),          # [B, max_nodes]
+        "node_roles": torch.stack(node_roles_list, dim=0),        # [B, max_nodes]
         "assignment_target": torch.stack(assignment_list, dim=0),  # [B, max_faces, max_nodes]
-        "hosted_adj": torch.stack(hosted_adj_list, dim=0),  # [B, max_nodes, max_nodes]
-        "thin_wall_adj": torch.stack(thin_wall_adj_list, dim=0),  # [B, max_nodes, max_nodes]
+        "hosted_adj": torch.stack(hosted_adj_list, dim=0),        # [B, max_nodes, max_nodes]
+        "thin_wall_adj": torch.stack(thin_wall_adj_list, dim=0),    # [B, max_nodes, max_nodes]
     }
