@@ -1,0 +1,71 @@
+schema_version: innovation2_stagewise_prior_v1
+
+paths:
+  eligible_index: innovation2_z/data/deepcad/eligible_uids.jsonl
+  compact_prior: innovation1_v3_brep_motif_graph/output_deepcad_full/outputs/dataset/motif_dataset.jsonl
+  step_root: innovation1_v3_brep_motif_graph/deepcad_data/cad_step
+  data_dir: innovation2_z/data/deepcad
+  checkpoint_root: checkpoints_base/deepcad
+  adapter_dir: innovation2_z/checkpoints
+  output_dir: innovation2_z/outputs/pilot_100
+
+data:
+  max_faces: 30
+  max_edges: 108
+  max_vertices: 186
+  max_face_edges: 20
+  max_vertex_faces: 12
+  bbox_bins: 16
+  bbox_prior_levels: 4
+  bbox_scaled: 3.0
+  motif_types: [sheet_region, loop_or_hole, repeated_feature]
+  relation_types: [embedded_in, hosted_by, thin_wall_pair]
+  surface_types: [plane, cylinder, cone, sphere, torus, freeform_or_other]
+
+adapter:
+  hidden_dim: 128
+  dropout: 0.1
+  condition_dropout: 0.1
+  initial_gate: 0.0
+
+training:
+  seed: 2026
+  batch_size:
+    face_edge: 64
+    face_bbox: 32
+    face_geom: 16
+  epochs:
+    face_edge: 15
+    face_bbox: 10
+    face_geom: 10
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  patience: 3
+  num_workers: 0
+  gradient_clip: 1.0
+  amp: true
+
+generation:
+  seed: 9000
+  requests: 100
+  edge_vert_attempts: 10
+  face_edge_samples_per_request: 1
+  geometry_candidates: 1
+  top_up_failures: false
+  prior_split: train
+  gate:
+    face_edge: 0.3
+    face_bbox: 0.0
+    face_geom: 0.0
+
+evaluation:
+  reference_count: 1000
+  point_count: 2000
+  bootstrap_samples: 1000
+  pilot_gate:
+    vss_gain_points: 5.0
+    max_novel_drop_points: 5.0
+    max_unique_drop_points: 5.0
+    max_cov_drop_points: 5.0
+    max_mmd_relative_worsening: 0.10
+    max_jsd_relative_worsening: 0.10
