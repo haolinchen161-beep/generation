@@ -1,13 +1,15 @@
-"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v6).
+"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v6.1).
 
 Implements Core Directives 1, 2, 4, 5, 7:
-- Pairwise Dot-Product assignment_head: (face_query @ node_key.T) / sqrt(d).
-- Dual Allocation Branches (node_roles aware):
-  - Host Branch (background 0 + sheet nodes): Masked Softmax -> host_context.
-  - Local Branch (hole & repeat nodes): Sigmoid -> local_context.
-  - Fusion via mlp_fuse(concat([host_context, local_context])).
-- Fixed TopoFaceEncoder: Neighbor degree mean calculated on unscaled raw degrees first.
-- Unified PriorAllocator module with max_nodes = 64.
+- MAX_MOTIF_NODES = 96.
+- MotifNodeEncoder: Projects K & V and masks with node_mask to eliminate linear projection bias on padding nodes.
+- Pairwise Dot-Product assignment_head with invalid node masked_fill(-1e4).
+- Node Role Filters:
+  - host_node_mask = valid_node_mask & ((node_roles == -1) | (node_roles == 0))
+  - local_node_mask = valid_node_mask & ((node_roles == 1) | (node_roles == 2))
+- Host Branch: Masked Softmax -> host_context.
+- Local Branch: Sigmoid normalized by local_mass (local_probs.sum(-1, keepdim=True).clamp_min(1.0)) -> local_context.
+- Fusion: mlp_fuse(concat([host_context, local_context])) -> zero_proj -> per_face_prior.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+MAX_MOTIF_NODES = 96
 
 
 class MotifNodeEncoder(nn.Module):
@@ -56,10 +60,14 @@ class MotifNodeEncoder(nn.Module):
         m_thin = torch.bmm(thin_wall_adj, self.thin_proj(h))
 
         h_rel = self.norm(h + m_hosted + m_thin)
-        h_rel = h_rel * node_mask.unsqueeze(-1).float()
 
         K = self.k_proj(h_rel)
         V = self.v_proj(h_rel)
+
+        # Directive 1: Multiply K & V by node_mask AFTER linear projection to eliminate bias leakage on padding nodes!
+        mask = node_mask.unsqueeze(-1).to(K.dtype)
+        K = K * mask
+        V = V * mask
         return K, V
 
 
@@ -112,9 +120,9 @@ class TopoFaceEncoder(nn.Module):
 
 
 class CrossAttentionAllocator(nn.Module):
-    """Directive 1, 2: Pairwise Dot-Product assignment_head & Dual-Branch (Host/Local) Context Fusion."""
+    """Directive 1, 2, 4: Pairwise Dot-Product assignment_head & Dual-Branch (Host/Local) Context Fusion."""
 
-    def __init__(self, embed_dim: int = 512, max_nodes: int = 64, num_heads: int = 4):
+    def __init__(self, embed_dim: int = 512, max_nodes: int = MAX_MOTIF_NODES, num_heads: int = 4):
         super().__init__()
         self.max_nodes = max_nodes
         self.attn = nn.MultiheadAttention(
@@ -159,7 +167,7 @@ class CrossAttentionAllocator(nn.Module):
         # K, V: [b, N_nodes, 512]
         # face_mask: [b, N_faces]
         # node_mask: [b, N_nodes] (node 0 background is always True)
-        # node_roles: [b, N_nodes] (-1: background, 0: sheet, 1: hole, 2: repeat)
+        # node_roles: [b, N_nodes] (-2: pad, -1: background, 0: sheet, 1: hole, 2: repeat)
 
         key_padding_mask = ~node_mask  # [b, N_nodes]
 
@@ -173,32 +181,38 @@ class CrossAttentionAllocator(nn.Module):
         # 1. Role Logits [B, N_faces, 3]
         role_logits = self.role_head(attn_out)
 
-        # 2. Directive 1: Pairwise Dot-Product Assignment Logits [B, N_faces, N_nodes]
+        # 2. Pairwise Dot-Product Assignment Logits [B, N_faces, N_nodes]
         fq = self.assignment_q(Q)  # [b, N_faces, 128]
         nk = self.assignment_k(K)  # [b, N_nodes, 128]
         assignment_logits = torch.bmm(fq, nk.transpose(1, 2)) / math.sqrt(128.0)  # [b, N_faces, N_nodes]
 
-        # 3. Directive 2: Dual Branch Allocation Probabilities over V
-        b_size, n_faces, n_nodes = assignment_logits.shape
+        # Directive 1: Mask out invalid nodes in assignment_logits
+        assignment_logits = assignment_logits.masked_fill(~node_mask.unsqueeze(1), -1e4)
 
-        # Host Mask: Background (-1) and Sheet (0) nodes
-        host_node_mask = (node_roles == -1) | (node_roles == 0)  # [b, N_nodes]
-        host_mask_expanded = host_node_mask.unsqueeze(1).expand(-1, n_faces, -1)  # [b, N_faces, N_nodes]
+        # 3. Directive 1 & 2: Node Role Filters
+        valid_node_mask = node_mask.bool()  # [b, N_nodes]
 
-        # Local Mask: Hole (1) and Repeat (2) nodes
-        local_node_mask = (node_roles == 1) | (node_roles == 2)  # [b, N_nodes]
-        local_mask_expanded = local_node_mask.unsqueeze(1).expand(-1, n_faces, -1)  # [b, N_faces, N_nodes]
+        # Host Mask: Background (-1) and Sheet (0) nodes ONLY! (Excludes padding -2 and hole/repeat)
+        host_node_mask = valid_node_mask & ((node_roles == -1) | (node_roles == 0))
+        host_mask_expanded = host_node_mask.unsqueeze(1).expand(-1, Q.shape[1], -1)
 
-        # Branch 1: Host Branch (Masked Softmax)
-        host_logits = assignment_logits.masked_fill(~host_mask_expanded, -1e9)
+        # Local Mask: Hole (1) and Repeat (2) nodes ONLY!
+        local_node_mask = valid_node_mask & ((node_roles == 1) | (node_roles == 2))
+        local_mask_expanded = local_node_mask.unsqueeze(1).expand(-1, Q.shape[1], -1)
+
+        # Branch 1: Host Branch (Masked Softmax over Host nodes)
+        host_logits = assignment_logits.masked_fill(~host_mask_expanded, -1e4)
         host_probs = F.softmax(host_logits, dim=-1) * host_mask_expanded.float()
         host_context = torch.bmm(host_probs, V)  # [b, N_faces, 512]
 
-        # Branch 2: Local Branch (Sigmoid Multi-Label)
+        # Branch 2: Local Branch (Sigmoid Multi-Label normalized by local_mass)
         local_probs = torch.sigmoid(assignment_logits) * local_mask_expanded.float()
-        local_context = torch.bmm(local_probs, V)  # [b, N_faces, 512]
 
-        # Directive 2: Fusion without unified normalization!
+        # Directive 4: Normalize by local_mass to prevent amplitude explosion!
+        local_mass = local_probs.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        local_context = torch.bmm(local_probs, V) / local_mass  # [b, N_faces, 512]
+
+        # Directive 2: Dual Branch Fusion without unified normalization
         fused_context = self.mlp_fuse(torch.cat([host_context, local_context], dim=-1))
 
         # Zero-projected residual prior
@@ -211,7 +225,7 @@ class CrossAttentionAllocator(nn.Module):
 class PriorAllocator(nn.Module):
     """Unified PriorAllocator Module encapsulating NodeEncoder, TopoEncoder, and Allocator."""
 
-    def __init__(self, embed_dim: int = 512, max_nodes: int = 64):
+    def __init__(self, embed_dim: int = 512, max_nodes: int = MAX_MOTIF_NODES):
         super().__init__()
         self.node_encoder = MotifNodeEncoder(node_in_dim=11, embed_dim=embed_dim)
         self.topo_encoder = TopoFaceEncoder(embed_dim=embed_dim)
@@ -266,7 +280,7 @@ class GuidedMLPInX(nn.Module):
 class PriorFaceBboxModel(nn.Module):
     """Wrapper around official DTG FaceBboxTransformer to inject per_face_prior embeddings."""
 
-    def __init__(self, base_model: nn.Module, embed_dim: int = 512, max_nodes: int = 64):
+    def __init__(self, base_model: nn.Module, embed_dim: int = 512, max_nodes: int = MAX_MOTIF_NODES):
         super().__init__()
         self.base = base_model
         self.prior_allocator = PriorAllocator(embed_dim=embed_dim, max_nodes=max_nodes)
@@ -297,12 +311,15 @@ class PriorFaceBboxModel(nn.Module):
 def build_prior_face_bbox_model(official_model: nn.Module) -> PriorFaceBboxModel:
     """Build PriorFaceBboxModel wrapping official pretrained FaceBbox model."""
     embed_dim = 512
-    if hasattr(official_model, "mlp_in_X") and hasattr(official_model.mlp_in_X[-1], "out_features"):
-        embed_dim = official_model.mlp_in_X[-1].out_features
+    if hasattr(official_model, "mlp_in_X"):
+        if isinstance(official_model.mlp_in_X, nn.Sequential) and hasattr(official_model.mlp_in_X[-1], "out_features"):
+            embed_dim = official_model.mlp_in_X[-1].out_features
+        elif hasattr(official_model.mlp_in_X, "out_features"):
+            embed_dim = official_model.mlp_in_X.out_features
     elif hasattr(official_model, "embed_dim"):
         embed_dim = official_model.embed_dim
     elif hasattr(official_model, "d_model"):
         embed_dim = official_model.d_model
 
-    model = PriorFaceBboxModel(official_model, embed_dim=embed_dim, max_nodes=64)
+    model = PriorFaceBboxModel(official_model, embed_dim=embed_dim, max_nodes=MAX_MOTIF_NODES)
     return model
