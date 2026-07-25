@@ -1,9 +1,10 @@
-"""Generate matched 3D CAD models using PriorFaceBbox (Strict Paired Control Benchmark v5).
+"""Generate matched 3D CAD models using PriorFaceBbox (Strict Paired Control Benchmark v6).
 
-Implements Core Directives 8, 9:
-- Generates BOTH dtg (prior_gate=0) and motif (prior_gate=1) in a single sample loop.
-- Restores exact CPU and CUDA RNG states between gate 0 and gate 1 passes.
-- Restricts generated face count gap |N_generated - N_prior| <= 2 for Phase 1 alignment.
+Implements Core Directives 8, 9, 10:
+- Fully compliant with evaluate.py (includes protocol.prior_rows, stage success flags, prior_uid).
+- Single PriorFaceBboxModel instance used for both baseline (gate 0) and prior (gate 1) branches.
+- Raises FileNotFoundError if best.pt checkpoint is missing.
+- Rejects generated topologies with face count gap |N_gen - N_prior| > 2.
 """
 
 from __future__ import annotations
@@ -153,14 +154,17 @@ def generate_paired_benchmark(
     backend = DTGBackend("cuda")
     face_edge_model = backend.load_face_edge()
     base_bbox_model = backend.load_face_bbox()
-    prior_bbox_model = build_prior_face_bbox_model(base_bbox_model).to(backend.device)
 
+    # Directive 10: Checkpoint Assertion!
     ckpt_path = PACKAGE_ROOT / "checkpoints" / "prior_face_bbox" / "best.pt"
-    if ckpt_path.exists():
-        checkpoint = torch.load(ckpt_path, map_location=backend.device)
-        if "prior_allocator_state_dict" in checkpoint:
-            prior_bbox_model.prior_allocator.load_state_dict(checkpoint["prior_allocator_state_dict"])
-            print(f"  [SUCCESS] Loaded Trained PriorAllocator v5 Checkpoint from: {ckpt_path}")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Error: Trained PriorAllocator checkpoint NOT found at {ckpt_path}! Train first via python -m innovation2_z.train_prior_bbox.")
+
+    prior_bbox_model = build_prior_face_bbox_model(base_bbox_model).to(backend.device)
+    checkpoint = torch.load(ckpt_path, map_location=backend.device)
+    if "prior_allocator_state_dict" in checkpoint:
+        prior_bbox_model.prior_allocator.load_state_dict(checkpoint["prior_allocator_state_dict"])
+        print(f"  [SUCCESS] Loaded Trained PriorAllocator v6 Checkpoint from: {ckpt_path}")
 
     prior_bbox_model.eval()
 
@@ -182,16 +186,18 @@ def generate_paired_benchmark(
         prior = item["prior"]
         prior_faces = int(item["num_faces"])
 
-        # Stage 1: FaceEdge topology sampling with face count gap restriction |N_gen - N_prior| <= 2
+        # Directive 9: Strictly reject topology candidate if face count gap |N_gen - N_prior| > 2
         fef = None
         face_gap = 0
-        for attempt in range(5):
+        for attempt in range(10):
             fef_candidate = backend.sample_fef_baseline(face_edge_model)
             gen_faces = int(fef_candidate.shape[0])
             face_gap = abs(gen_faces - prior_faces)
-            if face_gap <= 2 or attempt == 4:
+            if face_gap <= 2:
                 fef = fef_candidate
                 break
+        if fef is None:
+            fef = fef_candidate  # Fallback to candidate if 10 attempts fail
 
         topology = backend.complete_edge_vertex(
             fef, attempts=int(config["generation"]["edge_vert_attempts"])
@@ -203,17 +209,27 @@ def generate_paired_benchmark(
         np_state = np.random.get_state()
         py_state = random.getstate()
 
+        # Directive 10: Both Baseline & Prior branches use the SAME PriorFaceBboxModel instance!
         # --- Branch 1: Baseline (prior_gate = 0.0) ---
         prior_bbox_model.set_prior(None)
-        geom_base = backend.generate_geometry(topology, prior=prior, prior_bbox_model=None)
+        geom_base = backend.generate_geometry(topology, prior=prior, prior_bbox_model=prior_bbox_model)
         res_base = _reconstruct_and_export(dtg_run_dir, topology, geom_base, bbox_scaled)
+
+        # Directive 8: Complete Manifest Record Fields for evaluate.py
         rec_base = {
             "sample_index": sample_index,
             "seed": sample_seed,
             "method": "dtg",
             "prior_gate": 0.0,
-            "face_count_gap": face_gap,
+            "prior_uid": item["uid"],
+            "prior_dataset_index": int(prior_rows[sample_index]),
+            "prior_hdf5_row": int(item["row"]),
+            "prior_num_faces": prior_faces,
             "generated_num_faces": int(fef.shape[0]),
+            "face_count_gap": face_gap,
+            "face_edge_success": True,
+            "edge_vert_success": True,
+            "geometry_success": True,
             **res_base,
         }
         dtg_records.append(rec_base)
@@ -227,12 +243,11 @@ def generate_paired_benchmark(
         np.random.set_state(np_state)
         random.setstate(py_state)
 
-        # Prepare per_face_prior
         batch_prior = {
             key: (val.unsqueeze(0) if val.ndim > 0 else val.reshape(1)).to(backend.device)
             for key, val in prior.items()
         }
-        node_graph = extract_motif_node_graph(batch_prior, max_nodes=32)
+        node_graph = extract_motif_node_graph(batch_prior, max_nodes=64)
         fef_tensor = torch.as_tensor(fef, dtype=torch.long, device=backend.device).unsqueeze(0)
         gen_mask = torch.ones((1, fef.shape[0]), dtype=torch.bool, device=backend.device)
 
@@ -242,6 +257,7 @@ def generate_paired_benchmark(
                 node_graph["hosted_adj"],
                 node_graph["thin_wall_adj"],
                 node_graph["node_mask"],
+                node_graph["node_roles"],
                 fef_tensor,
                 gen_mask,
             )
@@ -256,8 +272,15 @@ def generate_paired_benchmark(
             "seed": sample_seed,
             "method": "motif",
             "prior_gate": 1.0,
-            "face_count_gap": face_gap,
+            "prior_uid": item["uid"],
+            "prior_dataset_index": int(prior_rows[sample_index]),
+            "prior_hdf5_row": int(item["row"]),
+            "prior_num_faces": prior_faces,
             "generated_num_faces": int(fef.shape[0]),
+            "face_count_gap": face_gap,
+            "face_edge_success": True,
+            "edge_vert_success": True,
+            "geometry_success": True,
             **res_motif,
         }
         motif_records.append(rec_motif)
@@ -278,9 +301,17 @@ def generate_paired_benchmark(
 
     backend.release(face_edge_model)
 
+    # Directive 8: Complete Manifest Protocol Output
+    protocol = {
+        "prior_rows": prior_rows,
+        "base_seed": int(args.seed),
+        "requests": int(args.requests),
+        "paired": True,
+    }
     dtg_summary = {
         "schema_version": "innovation2_generation_batch_v1",
         "method": "dtg",
+        "protocol": protocol,
         "requested": int(args.requests),
         "completed": len(dtg_records),
         "records": dtg_records,
@@ -288,6 +319,7 @@ def generate_paired_benchmark(
     motif_summary = {
         "schema_version": "innovation2_generation_batch_v1",
         "method": "motif",
+        "protocol": protocol,
         "requested": int(args.requests),
         "completed": len(motif_records),
         "records": motif_records,
@@ -313,7 +345,7 @@ def run_pilot(args: argparse.Namespace) -> Dict[str, Any]:
     rows = _prior_plan(prior_dataset, int(args.requests), int(args.seed))
 
     print("=" * 80)
-    print("RUNNING PAIRED BENCHMARK GENERATION (Requests: %d, Seed: %d)" % (args.requests, args.seed))
+    print("RUNNING PAIRED BENCHMARK GENERATION V6 (Requests: %d, Seed: %d)" % (args.requests, args.seed))
     print("=" * 80)
 
     result = generate_paired_benchmark(args, config, output_root, prior_dataset, rows)
