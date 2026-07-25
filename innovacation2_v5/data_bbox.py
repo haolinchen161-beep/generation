@@ -1,363 +1,239 @@
-"""Read-only DTGBrepGen backend with explicit stage-wise residual hooks."""
+"""Data preprocessing and feature extraction for PriorFaceBbox (v6.1).
+
+Implements Core Directives 1, 2, 5:
+- Constants: MAX_MOTIF_NODES = 96, PAD_ROLE = -2, BACKGROUND_ROLE = -1, SHEET_ROLE = 0, HOLE_ROLE = 1, REPEAT_ROLE = 2.
+- Node 0 = Permanent Background Node (node_mask[:, 0] = True, node_roles[:, 0] = -1). Padding nodes have role = -2.
+- Background assignment: For every valid face, if it does not belong to any Sheet node, assignment_target[face_id, 0] = 1.0!
+- Explicit overflow exception: raises RuntimeError if required nodes >= MAX_MOTIF_NODES.
+- Type-constrained & row-normalized relation graph (hosted_by: local -> sheet; thin_wall_pair: sheet <-> sheet).
+"""
 
 from __future__ import annotations
 
-import gc
-import hashlib
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
-import numpy as np
+import warnings
 import torch
-import yaml
-from diffusers import DDPMScheduler, PNDMScheduler
+import torch.nn.functional as F
+from typing import Dict, Any, Tuple
 
-from inference.generate import get_edgeGeom, get_faceBbox, get_faceGeom, get_vertGeom
-from model import (
-    EdgeGeomTransformer,
-    EdgeVertModel,
-    FaceBboxTransformer,
-    FaceEdgeModel,
-    FaceGeomTransformer,
-    VertGeomTransformer,
-)
-from topology.topoGenerate import SeqGenerator
-from topology.transfer import faceVert_from_edgeVert, face_vert_trans
-from utils import calculate_y, sort_bbox_multi
+MAX_MOTIF_NODES = 96
+PAD_ROLE = -2
+BACKGROUND_ROLE = -1
+SHEET_ROLE = 0
+HOLE_ROLE = 1
+REPEAT_ROLE = 2
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_ROOT.parent
-CHECKPOINT_ROOT = PROJECT_ROOT / "checkpoints_base" / "deepcad"
+def extract_global_prior_features(prior_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Extract sample-level global prior feature vector (14D) with CORRECTED relation channel indices."""
+    device = prior_dict["face_mask"].device
+    batch_size = prior_dict["face_mask"].shape[0]
+    face_mask = prior_dict["face_mask"].bool()  # [b, max_faces]
+
+    # 1. Surface Type Histogram (6 categories)
+    stype = prior_dict["surface_type"].long().clamp(0, 5)  # [b, max_faces]
+    stype_oh = F.one_hot(stype, num_classes=6).float() * face_mask.unsqueeze(-1).float()
+    stype_dist = stype_oh.sum(dim=1) / (face_mask.sum(dim=1, keepdim=True).clamp_min(1.0))
+
+    # 2. Mean Surface Confidence
+    sconf = prior_dict["surface_confidence"].float() * face_mask.float()
+    mean_sconf = sconf.sum(dim=1, keepdim=True) / (face_mask.sum(dim=1, keepdim=True).clamp_min(1.0))
+
+    # 3. Motif Membership Counts
+    mmem = prior_dict["motif_membership"].float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 3]
+    motif_counts = mmem.sum(dim=1) / 10.0
+
+    # 4. Pair Relations: Channel 0 for hosted_by, Channel 1 for thin_wall_pair
+    pair_rel = prior_dict["pair_relations"].float()  # [b, max_faces, max_faces, 2 or 3]
+    if pair_rel.shape[-1] >= 1:
+        hosted_count = pair_rel[:, :, :, 0].sum(dim=(1, 2)).reshape(batch_size, 1) / 10.0
+    else:
+        hosted_count = torch.zeros((batch_size, 1), device=device)
+
+    if pair_rel.shape[-1] >= 2:
+        thin_wall_count = pair_rel[:, :, :, 1].sum(dim=(1, 2)).reshape(batch_size, 1) / 10.0
+    else:
+        thin_wall_count = torch.zeros((batch_size, 1), device=device)
+
+    # 5. Valid Face Ratio & Mean Degree
+    face_ratio = face_mask.float().sum(dim=1, keepdim=True) / 30.0
+    fdegree = prior_dict["face_edge_cont"].float() if "face_edge_cont" in prior_dict else torch.zeros_like(sconf)
+    while fdegree.ndim > 2:
+        fdegree = fdegree.squeeze(-1) if fdegree.shape[-1] == 1 else fdegree.mean(dim=-1)
+    mean_degree = (fdegree * face_mask.float()).sum(dim=1, keepdim=True) / (
+        face_mask.sum(dim=1, keepdim=True).clamp_min(1.0) * 10.0
+    )
+
+    global_prior = torch.cat(
+        [stype_dist, mean_sconf, motif_counts, hosted_count, thin_wall_count, face_ratio, mean_degree],
+        dim=-1,
+    )
+    return global_prior
 
 
-class _SeqAdapter:
-    def __init__(self, model: EdgeVertModel):
-        self.model = model
+def extract_motif_node_graph(
+    prior_dict: Dict[str, torch.Tensor],
+    max_nodes: int = MAX_MOTIF_NODES,
+) -> Dict[str, torch.Tensor]:
+    """Core Directives 1, 2, 5: Construct Motif Graph Nodes with Background Node & Type-Constrained Edges.
 
-    def sample(self, topo_seq, seq_mask, mask, class_label, point_data=None):
-        return self.model.sample(topo_seq, seq_mask, mask, class_label, point_data=None)
+    Node 0: Permanent Background Node (node_mask[:, 0] = True, node_roles[:, 0] = BACKGROUND_ROLE = -1).
+    Padding nodes: node_roles = PAD_ROLE = -2.
+    Nodes 1..max_nodes-1: Real Motif Instance Nodes (channel, instance_id).
 
-    def parameters(self):
-        return self.model.parameters()
+    Returns:
+      node_features:     [B, max_nodes, 11]
+      node_mask:         [B, max_nodes] (bool, node 0 always True)
+      node_roles:        [B, max_nodes] (long: -2=pad, -1=background, 0=sheet, 1=hole, 2=repeat)
+      assignment_target: [B, N_faces, max_nodes] (multi-hot, float)
+      hosted_adj:        [B, max_nodes, max_nodes] (row-normalized)
+      thin_wall_adj:     [B, max_nodes, max_nodes] (row-normalized)
+    """
+    device = prior_dict["face_mask"].device
+    batch_size, max_faces = prior_dict["face_mask"].shape
 
+    face_mask = prior_dict["face_mask"].bool()  # [b, max_faces]
+    stype = prior_dict["surface_type"].long().clamp(0, 5)  # [b, max_faces]
+    stype_oh = F.one_hot(stype, num_classes=6).float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 6]
 
-def checkpoint_checksums() -> Dict[str, str]:
-    result = {}
-    for path in sorted(CHECKPOINT_ROOT.rglob("*.pt")):
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        result[str(path.relative_to(PROJECT_ROOT))] = digest.hexdigest()
-    return result
+    if "motif_confidence" in prior_dict:
+        mconf = prior_dict["motif_confidence"].float()
+        if mconf.ndim == 2:
+            mconf = mconf.unsqueeze(-1)
+    else:
+        mconf = prior_dict["surface_confidence"].float().unsqueeze(-1)  # [b, max_faces, 1]
 
+    mmem = prior_dict["motif_membership"].float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 3]
+    minst = prior_dict["motif_instance"] if "motif_instance" in prior_dict else torch.zeros_like(mmem)
 
-class DTGBackend:
-    """Load one large frozen stage at a time to fit a 4-GB GPU."""
+    if minst.ndim == 2:
+        minst = minst.unsqueeze(-1)  # [b, max_faces, 1]
 
-    def __init__(self, device: str = "cuda"):
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required for full DTG generation")
-        self.device = torch.device(device)
-        with (PROJECT_ROOT / "config.yaml").open("r", encoding="utf-8") as handle:
-            self.config = yaml.safe_load(handle)["deepcad"]
+    pair_rel = prior_dict["pair_relations"].float()  # [b, max_faces, max_faces, R]
 
-    def _load_state(self, model: torch.nn.Module, relative_path: str) -> torch.nn.Module:
-        state = torch.load(str(CHECKPOINT_ROOT / relative_path), map_location="cpu")
-        model.load_state_dict(state, strict=True)
-        model.requires_grad_(False)
-        return model.to(self.device).eval()
+    node_features_list = []
+    node_mask_list = []
+    node_roles_list = []
+    assignment_list = []
+    hosted_adj_list = []
+    thin_wall_adj_list = []
 
-    @staticmethod
-    def release(model: torch.nn.Module) -> None:
-        model.to("cpu")
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    for b in range(batch_size):
+        # Node 0 is reserved for background node (role = BACKGROUND_ROLE = -1)
+        node_dicts = [{"key": "background", "role": BACKGROUND_ROLE, "faces": []}]
 
-    def load_face_edge(self) -> FaceEdgeModel:
-        network = self.config["FaceEdgeModel"]
-        return self._load_state(
-            FaceEdgeModel(
-                nf=self.config["max_face"],
-                d_model=network["d_model"],
-                nhead=network["nhead"],
-                n_layers=network["n_layers"],
-                num_categories=self.config["edge_classes"],
-                use_cf=False,
-                use_pc=False,
-            ),
-            "topo_faceEdge/epoch_2000.pt",
-        )
+        valid_faces = torch.where(face_mask[b])[0].tolist()
 
-    def load_edge_vert(self) -> EdgeVertModel:
-        network = self.config["EdgeVertModel"]
-        return self._load_state(
-            EdgeVertModel(
-                max_num_edge=self.config["max_num_edge_topo"],
-                max_seq_length=self.config["max_seq_length"],
-                edge_classes=self.config["edge_classes"],
-                max_face=self.config["max_face"],
-                max_edge=self.config["max_edge"],
-                d_model=network["d_model"],
-                n_layers=network["n_layers"],
-                use_cf=False,
-                use_pc=False,
-            ),
-            "topo_edgeVert/epoch_1000.pt",
-        )
+        for f_idx in valid_faces:
+            for ch in range(minst.shape[-1]):
+                inst_val = int(minst[b, f_idx, ch].item()) if ch < minst.shape[-1] else 0
+                if inst_val > 0:
+                    group_key = (ch, inst_val)
+                    found = False
+                    for n_idx, nd in enumerate(node_dicts):
+                        if nd.get("key") == group_key:
+                            nd["faces"].append(f_idx)
+                            found = True
+                            break
+                    if not found:
+                        if len(node_dicts) >= max_nodes:
+                            # Directive 5: Explicit overflow exception!
+                            raise RuntimeError(f"motif node overflow: required more than {max_nodes} nodes for sample {b}!")
+                        node_dicts.append({"key": group_key, "role": ch, "faces": [f_idx]})
 
-    def load_face_bbox(self) -> FaceBboxTransformer:
-        network = self.config["FaceBboxModel"]
-        return self._load_state(
-            FaceBboxTransformer(
-                n_layers=network["n_layers"],
-                hidden_mlp_dims=network["hidden_mlp_dims"],
-                hidden_dims=network["hidden_dims"],
-                edge_classes=self.config["edge_classes"],
-                act_fn_in=torch.nn.ReLU(),
-                act_fn_out=torch.nn.ReLU(),
-                use_cf=False,
-                use_pc=False,
-            ),
-            "geom_faceBbox/epoch_3000.pt",
-        )
+        num_nodes = len(node_dicts)
 
-    def load_vert_geom(self) -> VertGeomTransformer:
-        network = self.config["VertGeomModel"]
-        return self._load_state(
-            VertGeomTransformer(
-                n_layers=network["n_layers"],
-                hidden_mlp_dims=network["hidden_mlp_dims"],
-                hidden_dims=network["hidden_dims"],
-                act_fn_in=torch.nn.ReLU(),
-                act_fn_out=torch.nn.ReLU(),
-                use_cf=False,
-                use_pc=False,
-            ),
-            "geom_vertGeom/epoch_3000.pt",
-        )
+        nf = torch.zeros((max_nodes, 11), device=device)
+        nm = torch.zeros((max_nodes,), dtype=torch.bool, device=device)
+        # Directive 1: Padding nodes have PAD_ROLE = -2
+        nr = torch.full((max_nodes,), PAD_ROLE, dtype=torch.long, device=device)
+        asgn = torch.zeros((max_faces, max_nodes), device=device)
+        ha = torch.zeros((max_nodes, max_nodes), device=device)
+        ta = torch.zeros((max_nodes, max_nodes), device=device)
 
-    def load_edge_geom(self) -> EdgeGeomTransformer:
-        network = self.config["EdgeGeomModel"]
-        return self._load_state(
-            EdgeGeomTransformer(
-                n_layers=network["n_layers"],
-                edge_geom_dim=network["edge_geom_dim"],
-                d_model=network["d_model"],
-                nhead=network["nhead"],
-                use_cf=False,
-                use_pc=False,
-            ),
-            "geom_edgeGeom/epoch_3000.pt",
-        )
+        # Background node 0 is ALWAYS valid and has BACKGROUND_ROLE = -1
+        nm[0] = True
+        nr[0] = BACKGROUND_ROLE
+        nf[0, :] = 0.0
 
-    def load_face_geom(self) -> FaceGeomTransformer:
-        network = self.config["FaceGeomModel"]
-        return self._load_state(
-            FaceGeomTransformer(
-                n_layers=network["n_layers"],
-                face_geom_dim=network["face_geom_dim"],
-                d_model=network["d_model"],
-                nhead=network["nhead"],
-                use_cf=False,
-                use_pc=False,
-            ),
-            "geom_faceGeom/epoch_3000.pt",
-        )
+        sheet_node_indices = []
+        for n_idx in range(1, num_nodes):
+            nd = node_dicts[n_idx]
+            f_list = nd["faces"]
+            nm[n_idx] = True
+            nr[n_idx] = nd["role"]
 
-    @staticmethod
-    def schedulers() -> Tuple[PNDMScheduler, DDPMScheduler]:
-        pndm = PNDMScheduler(
-            num_train_timesteps=1000,
-            beta_schedule="linear",
-            prediction_type="epsilon",
-            beta_start=0.0001,
-            beta_end=0.02,
-        )
-        ddpm = DDPMScheduler(
-            num_train_timesteps=1000,
-            beta_schedule="linear",
-            prediction_type="epsilon",
-            beta_start=0.0001,
-            beta_end=0.02,
-            clip_sample=True,
-            clip_sample_range=3,
-        )
-        return pndm, ddpm
+            if nd["role"] == SHEET_ROLE:
+                sheet_node_indices.append(n_idx)
 
-    @torch.no_grad()
-    def sample_fef_baseline(self, model: FaceEdgeModel) -> np.ndarray:
-        matrix = model.sample(num_samples=1, class_label=None, point_data=None)[0]
-        active = torch.any(matrix != 0, dim=1)
-        matrix = matrix[active][:, active]
-        if matrix.numel() == 0:
-            raise RuntimeError("DTG FaceEdge generated an empty topology")
-        degree = matrix.sum(dim=1)
-        order = torch.argsort(degree)
-        return matrix[order][:, order].cpu().numpy().astype(np.int64)
+            for f in f_list:
+                asgn[f, n_idx] = 1.0
 
-    @torch.no_grad()
-    def sample_fef_guided(
-        self,
-        model: FaceEdgeModel,
-        adapter: FaceEdgeAdapter,
-        prior: Dict[str, torch.Tensor],
-        gate: float = 1.0,
-    ) -> np.ndarray:
-        if float(gate) == 0.0:
-            return self.sample_fef_baseline(model)
-        face_count = int(prior["face_mask"].sum().item())
-        if not 1 <= face_count <= int(self.config["max_face"]):
-            raise ValueError("prior face count is outside DTG range")
-        batch_prior = {
-            key: (value.unsqueeze(0) if value.ndim > 0 else value.reshape(1))
-            .to(self.device)
-            for key, value in prior.items()
-        }
-        z = torch.randn(1, model.d_model, device=self.device)
-        generated = torch.full(
-            (1, 1),
-            model.num_categories,
-            dtype=torch.long,
-            device=self.device,
-        )
-        pair_index = torch.triu_indices(model.nf, model.nf, offset=1, device=self.device)
-        for position in range(model.seq_len):
-            base_logits = model.decode(z, generated, None, None)[:, -1:, :]
-            pair = pair_index[:, position : position + 1]
-            i, j = int(pair[0, 0]), int(pair[1, 0])
-            if i >= face_count or j >= face_count:
-                next_token = torch.zeros(1, dtype=torch.long, device=self.device)
-            else:
-                delta = adapter(batch_prior, base_logits, pair)
-                logits = base_logits + float(gate) * delta
-                next_token = torch.distributions.Categorical(logits=logits[:, 0]).sample()
-            generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=1)
-        matrix = model.sequence_to_matrix(generated[:, 1:])[0, :face_count, :face_count]
-        active = torch.any(matrix != 0, dim=1)
-        matrix = matrix[active][:, active]
-        if not torch.any(matrix != 0):
-            raise RuntimeError("guided FaceEdge generated an empty topology")
-        return matrix.cpu().numpy().astype(np.int64)
+            # Node features (11D)
+            role_oh = F.one_hot(torch.tensor(nd["role"], device=device), num_classes=3).float()
+            st_mean = stype_oh[b, f_list].mean(dim=0)
+            mc_val = mconf[b, f_list].mean(dim=0)
+            if mc_val.numel() > 1:
+                mc_val = mc_val[nd["role"]:nd["role"]+1]
+            sz_ratio = torch.tensor([len(f_list) / 30.0], device=device)
+            nf[n_idx] = torch.cat([role_oh, st_mean, mc_val.reshape(1), sz_ratio], dim=-1)
 
-    def complete_edge_vertex(self, fef: np.ndarray, attempts: int = 10) -> Dict[str, Any]:
-        fef_tensor = torch.as_tensor(fef, dtype=torch.long, device=self.device)
-        if torch.any(fef_tensor.sum(dim=1) == 0):
-            raise ValueError("FaceEdge produced one or more isolated real-face slots")
-        indices = torch.triu(fef_tensor, diagonal=1).nonzero(as_tuple=False)
-        if not len(indices):
-            raise ValueError("face adjacency contains no shared edges")
-        multiplicity = fef_tensor[indices[:, 0], indices[:, 1]]
-        edge_face = indices.repeat_interleave(multiplicity, dim=0)
-        model = self.load_edge_vert()
-        if fef_tensor.sum(dim=1).max() > model.max_edge:
-            raise ValueError(
-                "face degree %d exceeds per-face edge limit %d"
-                % (fef_tensor.sum(dim=1).max().item(), model.max_edge)
-            )
-        try:
-            if edge_face.shape[0] > model.max_num_edge:
-                raise ValueError(
-                    "topology has %d edges, limit is %d" % (edge_face.shape[0], model.max_num_edge)
-                )
-            share_id = calculate_y(edge_face)
-            model.save_cache(
-                edgeFace_adj=edge_face.unsqueeze(0),
-                edge_mask=torch.ones((1, edge_face.shape[0]), device=self.device, dtype=torch.bool),
-                share_id=share_id,
-                class_label=None,
-                point_data=None,
-            )
-            generator = None
-            adapter = _SeqAdapter(model)
-            for _ in range(max(1, int(attempts))):
-                candidate = SeqGenerator(edge_face.cpu().numpy())
-                if candidate.generate(adapter, class_label=None):
-                    generator = candidate
-                    break
-            model.clear_cache()
-            if generator is None:
-                raise RuntimeError("DTG EdgeVert failed to complete closed face loops")
-            edge_vert = torch.as_tensor(generator.edgeVert_adj, dtype=torch.long, device=self.device)
-            face_edge = generator.faceEdge_adj
-            face_vert = faceVert_from_edgeVert(face_edge, generator.edgeVert_adj)
-            vert_face = face_vert_trans(faceVert_adj=face_vert)
-            return {
-                "fef_adj": fef_tensor,
-                "edgeFace_adj": edge_face,
-                "edgeVert_adj": edge_vert,
-                "faceEdge_adj": face_edge,
-                "vertFace_adj": vert_face,
-            }
-        finally:
-            self.release(model)
+        # Directive 2: Correct Background Host Target definition!
+        # If a face does not belong to ANY sheet node, set assignment_target[face_id, 0] = 1.0
+        for f in valid_faces:
+            has_sheet = any(asgn[f, sheet_id] > 0 for sheet_id in sheet_node_indices)
+            if not has_sheet:
+                asgn[f, 0] = 1.0
 
-    def generate_geometry(
-        self,
-        topology: Dict[str, Any],
-        prior: Optional[Dict[str, torch.Tensor]] = None,
-        prior_bbox_model: Optional[torch.nn.Module] = None,
-    ) -> Dict[str, np.ndarray]:
-        fef_list = [topology["fef_adj"]]
-        edge_face_list = [topology["edgeFace_adj"]]
-        edge_vert_list = [topology["edgeVert_adj"]]
-        face_edge_list = [topology["faceEdge_adj"]]
-        vert_face_list = [topology["vertFace_adj"]]
+        # Pair relations with TYPE CONSTRAINTS
+        if pair_rel.shape[-1] >= 1:
+            rel_h = pair_rel[b, :, :, 0]
+        else:
+            rel_h = torch.zeros((max_faces, max_faces), device=device)
 
-        pndm, ddpm = self.schedulers()
-        model = prior_bbox_model if prior_bbox_model is not None else self.load_face_bbox()
-        face_bbox_tensor, face_mask = get_faceBbox(fef_list, model, pndm, ddpm, None, None)
-        face_bbox = [sort_bbox_multi(values[mask]) for values, mask in zip(face_bbox_tensor, face_mask)]
-        if prior_bbox_model is None:
-            self.release(model)
+        if pair_rel.shape[-1] >= 2:
+            rel_t = pair_rel[b, :, :, 1]
+        else:
+            rel_t = torch.zeros((max_faces, max_faces), device=device)
 
-        pndm, ddpm = self.schedulers()
-        model = self.load_vert_geom()
-        vert_tensor, vert_mask = get_vertGeom(
-            face_bbox, vert_face_list, edge_vert_list, model, pndm, ddpm, None, None
-        )
-        vert_geom = [values[mask] for values, mask in zip(vert_tensor, vert_mask)]
-        self.release(model)
+        for n1 in range(1, num_nodes):
+            r1 = node_dicts[n1]["role"]
+            f1_list = node_dicts[n1]["faces"]
+            for n2 in range(1, num_nodes):
+                if n1 == n2:
+                    continue
+                r2 = node_dicts[n2]["role"]
+                f2_list = node_dicts[n2]["faces"]
 
-        pndm, ddpm = self.schedulers()
-        model = self.load_edge_geom()
-        edge_tensor, edge_mask = get_edgeGeom(
-            face_bbox,
-            vert_geom,
-            edge_face_list,
-            edge_vert_list,
-            model,
-            pndm,
-            ddpm,
-            None,
-            None,
-        )
-        edge_geom = [values[mask] for values, mask in zip(edge_tensor, edge_mask)]
-        self.release(model)
+                # hosted_by: ONLY allow local_node (r1=HOLE_ROLE or REPEAT_ROLE) -> sheet_node (r2=SHEET_ROLE)
+                if (r1 in (HOLE_ROLE, REPEAT_ROLE)) and (r2 == SHEET_ROLE):
+                    h_sum = rel_h[f1_list][:, f2_list].sum().item()
+                    if h_sum > 0:
+                        ha[n1, n2] = float(h_sum)
 
-        pndm, ddpm = self.schedulers()
-        model = self.load_face_geom()
-        face_tensor, generated_face_mask = get_faceGeom(
-            face_bbox,
-            vert_geom,
-            edge_geom,
-            face_edge_list,
-            edge_face_list,
-            edge_vert_list,
-            model,
-            pndm,
-            ddpm,
-            None,
-            None,
-        )
-        face_geom = [values[mask] for values, mask in zip(face_tensor, generated_face_mask)]
-        self.release(model)
-        return {
-            "face_bbox": face_bbox[0].float().cpu().numpy(),
-            "vert_geom": vert_geom[0].float().cpu().numpy(),
-            "edge_geom": edge_geom[0].float().cpu().numpy(),
-            "face_geom": face_geom[0].float().cpu().numpy(),
-        }
+                # thin_wall_pair: ONLY allow sheet_node (r1=SHEET_ROLE) <-> sheet_node (r2=SHEET_ROLE)
+                if (r1 == SHEET_ROLE) and (r2 == SHEET_ROLE):
+                    t_sum = rel_t[f1_list][:, f2_list].sum().item()
+                    if t_sum > 0:
+                        ta[n1, n2] = float(t_sum)
+
+        # Row normalization
+        ha_denom = ha.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ta_denom = ta.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ha = ha / ha_denom
+        ta = ta / ta_denom
+
+        node_features_list.append(nf)
+        node_mask_list.append(nm)
+        node_roles_list.append(nr)
+        assignment_list.append(asgn)
+        hosted_adj_list.append(ha)
+        thin_wall_adj_list.append(ta)
+
+    return {
+        "node_features": torch.stack(node_features_list, dim=0),  # [B, max_nodes, 11]
+        "node_mask": torch.stack(node_mask_list, dim=0),          # [B, max_nodes]
+        "node_roles": torch.stack(node_roles_list, dim=0),        # [B, max_nodes]
+        "assignment_target": torch.stack(assignment_list, dim=0),  # [B, max_faces, max_nodes]
+        "hosted_adj": torch.stack(hosted_adj_list, dim=0),        # [B, max_nodes, max_nodes]
+        "thin_wall_adj": torch.stack(thin_wall_adj_list, dim=0),    # [B, max_nodes, max_nodes]
+    }
