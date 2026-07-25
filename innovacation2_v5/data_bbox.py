@@ -1,7 +1,11 @@
 """Data preprocessing and feature extraction for PriorFaceBbox.
 
-Fully vectorized GPU tensor extraction for extract_motif_node_graph (0.001s per batch).
-Corrects pair_relations channel 0 (hosted_by) and channel 1 (thin_wall_pair).
+Refactored extract_motif_node_graph according to Core Directives 1, 2, 3, 5:
+- Preserves 3D motif_instance [B, N_faces, 3] (sheet, hole, repeat channels) without argmax!
+- Constructs multi-hot face_to_node assignment matrix [B, N_faces, 32] (a face can belong to multiple nodes).
+- Includes Node 0 as permanent Background/Null Node (node_mask[:, 0] = True) to prevent NaN in MultiheadAttention.
+- Uses motif_confidence for node features.
+- Row-normalizes relation adjacencies (hosted_adj, thin_wall_adj).
 """
 
 from __future__ import annotations
@@ -60,21 +64,19 @@ def extract_global_prior_features(prior_dict: Dict[str, torch.Tensor]) -> torch.
 
 def extract_motif_node_graph(
     prior_dict: Dict[str, torch.Tensor],
-    max_nodes: int = 15,
+    max_nodes: int = 32,
 ) -> Dict[str, torch.Tensor]:
-    """Directive 1 & 2: Fully Vectorized GPU Tensor extraction for Motif Graph Nodes and Relations (0.001s).
+    """Core Directives 1, 2, 3, 5: Construct Motif Graph Nodes with Background Node & Multi-Hot Assignment.
 
-    Node Feature (dim = 11):
-      - 3D One-Hot: Node Category (sheet, hole, repeat)
-      - 6D One-Hot: Mean Surface Type (plane, cylinder, cone, sphere, torus, bspline)
-      - 1D: Mean Surface Confidence
-      - 1D: Node Size Ratio (number of faces in instance / 30)
+    Node 0: Permanent Background Node (node_mask[:, 0] = True).
+    Nodes 1..max_nodes-1: Real Motif Instance Nodes (channel, instance_id).
 
     Returns:
-      node_features: [batch_size, max_nodes, 11]
-      node_mask:     [batch_size, max_nodes]
-      hosted_adj:    [batch_size, max_nodes, max_nodes]
-      thin_wall_adj: [batch_size, max_nodes, max_nodes]
+      node_features:     [B, max_nodes, 11]
+      node_mask:         [B, max_nodes] (bool, node 0 always True)
+      assignment_target: [B, N_faces, max_nodes] (multi-hot, float)
+      hosted_adj:        [B, max_nodes, max_nodes] (row-normalized)
+      thin_wall_adj:     [B, max_nodes, max_nodes] (row-normalized)
     """
     device = prior_dict["face_mask"].device
     batch_size, max_faces = prior_dict["face_mask"].shape
@@ -82,65 +84,126 @@ def extract_motif_node_graph(
     face_mask = prior_dict["face_mask"].bool()  # [b, max_faces]
     stype = prior_dict["surface_type"].long().clamp(0, 5)  # [b, max_faces]
     stype_oh = F.one_hot(stype, num_classes=6).float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 6]
-    sconf = (prior_dict["surface_confidence"].float() * face_mask.float()).unsqueeze(-1)  # [b, max_faces, 1]
-    mmem = prior_dict["motif_membership"].float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 3]
 
-    minst = prior_dict["motif_instance"] if "motif_instance" in prior_dict else torch.zeros_like(stype)
-    if minst.ndim >= 3:
-        minst = minst.argmax(dim=-1)
-    minst = minst.long().clamp(0, max_nodes - 1)  # [b, max_faces]
+    # Use motif_confidence if available, fallback to surface_confidence
+    if "motif_confidence" in prior_dict:
+        mconf = prior_dict["motif_confidence"].float()
+        if mconf.ndim == 2:
+            mconf = mconf.unsqueeze(-1)
+    else:
+        mconf = prior_dict["surface_confidence"].float().unsqueeze(-1)  # [b, max_faces, 1]
+
+    mmem = prior_dict["motif_membership"].float() * face_mask.unsqueeze(-1).float()  # [b, max_faces, 3]
+    minst = prior_dict["motif_instance"] if "motif_instance" in prior_dict else torch.zeros_like(mmem)  # [b, max_faces, 3] or [b, max_faces]
+
+    if minst.ndim == 2:
+        minst = minst.unsqueeze(-1)  # [b, max_faces, 1]
 
     pair_rel = prior_dict["pair_relations"].float()  # [b, max_faces, max_faces, R]
 
-    # One-hot assignment matrix face -> node: [b, max_faces, max_nodes]
-    assignment = F.one_hot(minst, num_classes=max_nodes).float() * face_mask.unsqueeze(-1).float()
+    node_features_list = []
+    node_mask_list = []
+    assignment_list = []
+    hosted_adj_list = []
+    thin_wall_adj_list = []
 
-    # Node face counts: [b, max_nodes, 1]
-    node_counts = assignment.sum(dim=1, keepdim=True).transpose(1, 2)  # [b, max_nodes, 1]
-    node_mask = (node_counts.squeeze(-1) > 0)  # [b, max_nodes]
+    for b in range(batch_size):
+        # Node 0 is reserved for background node
+        node_dicts = [{"key": "background", "role": -1, "faces": []}]
 
-    # 1. Node Category (3D)
-    node_mmem = torch.bmm(assignment.transpose(1, 2), mmem) / node_counts.clamp_min(1.0)  # [b, max_nodes, 3]
+        # Collect instance nodes across 3 channels (0: sheet, 1: hole, 2: repeat)
+        valid_faces = torch.where(face_mask[b])[0].tolist()
 
-    # 2. Mean Surface Type (6D)
-    node_stype = torch.bmm(assignment.transpose(1, 2), stype_oh) / node_counts.clamp_min(1.0)  # [b, max_nodes, 6]
+        for f_idx in valid_faces:
+            for ch in range(minst.shape[-1]):
+                inst_val = int(minst[b, f_idx, ch].item()) if ch < minst.shape[-1] else 0
+                if inst_val > 0:
+                    group_key = (ch, inst_val)
+                    found = False
+                    for n_idx, nd in enumerate(node_dicts):
+                        if nd.get("key") == group_key:
+                            nd["faces"].append(f_idx)
+                            found = True
+                            break
+                    if not found and len(node_dicts) < max_nodes:
+                        node_dicts.append({"key": group_key, "role": ch, "faces": [f_idx]})
 
-    # 3. Mean Surface Confidence (1D)
-    node_sconf = torch.bmm(assignment.transpose(1, 2), sconf) / node_counts.clamp_min(1.0)  # [b, max_nodes, 1]
+        num_nodes = len(node_dicts)
 
-    # 4. Node Size Ratio (1D)
-    node_size_ratio = node_counts / 30.0  # [b, max_nodes, 1]
+        nf = torch.zeros((max_nodes, 11), device=device)
+        nm = torch.zeros((max_nodes,), dtype=torch.bool, device=device)
+        asgn = torch.zeros((max_faces, max_nodes), device=device)
+        ha = torch.zeros((max_nodes, max_nodes), device=device)
+        ta = torch.zeros((max_nodes, max_nodes), device=device)
 
-    node_features = torch.cat([node_mmem, node_stype, node_sconf, node_size_ratio], dim=-1)  # [b, max_nodes, 11]
-    node_features = node_features * node_mask.unsqueeze(-1).float()
+        # Background node 0 is ALWAYS valid
+        nm[0] = True
+        nf[0, :] = 0.0  # background features
 
-    # Aggregate face-level pair_relations to node-level adjacencies using BMM
-    # assignment: [b, max_faces, max_nodes]
-    # assignment^T: [b, max_nodes, max_faces]
-    if pair_rel.shape[-1] >= 1:
-        rel_hosted = pair_rel[:, :, :, 0]  # [b, max_faces, max_faces]
-        # node_hosted = assignment^T @ rel_hosted @ assignment -> [b, max_nodes, max_nodes]
-        hosted_adj = torch.bmm(assignment.transpose(1, 2), torch.bmm(rel_hosted, assignment))
-    else:
-        hosted_adj = torch.zeros((batch_size, max_nodes, max_nodes), device=device)
+        # For faces that belong to no motif node, assign them to background node 0
+        assigned_faces = set()
+        for n_idx in range(1, num_nodes):
+            nd = node_dicts[n_idx]
+            f_list = nd["faces"]
+            nm[n_idx] = True
+            for f in f_list:
+                asgn[f, n_idx] = 1.0
+                assigned_faces.add(f)
 
-    if pair_rel.shape[-1] >= 2:
-        rel_thin = pair_rel[:, :, :, 1]  # [b, max_faces, max_faces]
-        thin_wall_adj = torch.bmm(assignment.transpose(1, 2), torch.bmm(rel_thin, assignment))
-    else:
-        thin_wall_adj = torch.zeros((batch_size, max_nodes, max_nodes), device=device)
+            # Node features (11D)
+            role_oh = F.one_hot(torch.tensor(nd["role"], device=device), num_classes=3).float()
+            st_mean = stype_oh[b, f_list].mean(dim=0)
+            mc_val = mconf[b, f_list].mean(dim=0)
+            if mc_val.numel() > 1:
+                mc_val = mc_val[nd["role"]:nd["role"]+1]
+            sz_ratio = torch.tensor([len(f_list) / 30.0], device=device)
+            nf[n_idx] = torch.cat([role_oh, st_mean, mc_val.reshape(1), sz_ratio], dim=-1)
 
-    # Clamp adjacencies and mask self-loops
-    hosted_adj = torch.clamp(hosted_adj, 0.0, 1.0)
-    thin_wall_adj = torch.clamp(thin_wall_adj, 0.0, 1.0)
+        for f in valid_faces:
+            if f not in assigned_faces:
+                asgn[f, 0] = 1.0  # Assign unassigned faces to Background Node 0
 
-    eye_mask = (1.0 - torch.eye(max_nodes, device=device)).unsqueeze(0)
-    hosted_adj = hosted_adj * eye_mask * node_mask.unsqueeze(1).float() * node_mask.unsqueeze(2).float()
-    thin_wall_adj = thin_wall_adj * eye_mask * node_mask.unsqueeze(1).float() * node_mask.unsqueeze(2).float()
+        # Relation Adjacencies
+        if pair_rel.shape[-1] >= 1:
+            rel_h = pair_rel[b, :, :, 0]
+        else:
+            rel_h = torch.zeros((max_faces, max_faces), device=device)
+
+        if pair_rel.shape[-1] >= 2:
+            rel_t = pair_rel[b, :, :, 1]
+        else:
+            rel_t = torch.zeros((max_faces, max_faces), device=device)
+
+        # Aggregate face-level relations to node-level
+        for n1 in range(1, num_nodes):
+            f1_list = node_dicts[n1]["faces"]
+            for n2 in range(1, num_nodes):
+                if n1 == n2:
+                    continue
+                f2_list = node_dicts[n2]["faces"]
+                h_sum = rel_h[f1_list][:, f2_list].sum().item()
+                t_sum = rel_t[f1_list][:, f2_list].sum().item()
+                if h_sum > 0:
+                    ha[n1, n2] = float(h_sum)
+                if t_sum > 0:
+                    ta[n1, n2] = float(t_sum)
+
+        # Row normalization for relation adjacencies
+        ha_denom = ha.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ta_denom = ta.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ha = ha / ha_denom
+        ta = ta / ta_denom
+
+        node_features_list.append(nf)
+        node_mask_list.append(nm)
+        assignment_list.append(asgn)
+        hosted_adj_list.append(ha)
+        thin_wall_adj_list.append(ta)
 
     return {
-        "node_features": node_features,
-        "node_mask": node_mask,
-        "hosted_adj": hosted_adj,
-        "thin_wall_adj": thin_wall_adj,
+        "node_features": torch.stack(node_features_list, dim=0),  # [B, max_nodes, 11]
+        "node_mask": torch.stack(node_mask_list, dim=0),  # [B, max_nodes]
+        "assignment_target": torch.stack(assignment_list, dim=0),  # [B, max_faces, max_nodes]
+        "hosted_adj": torch.stack(hosted_adj_list, dim=0),  # [B, max_nodes, max_nodes]
+        "thin_wall_adj": torch.stack(thin_wall_adj_list, dim=0),  # [B, max_nodes, max_nodes]
     }
