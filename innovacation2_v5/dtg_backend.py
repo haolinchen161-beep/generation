@@ -25,8 +25,6 @@ from topology.topoGenerate import SeqGenerator
 from topology.transfer import faceVert_from_edgeVert, face_vert_trans
 from utils import calculate_y, sort_bbox_multi
 
-from .adapters import FaceEdgeAdapter, ResidualDenoiser
-
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
