@@ -1,14 +1,12 @@
-"""Training script for PriorFaceBbox (Cross-Attention Face Role & Instance Allocator v6.1).
+"""Training script for PriorFaceBbox (Cross-Attention Face Role & Instance Allocator v6.1 Final).
 
-Implements Core Directives 3, 6, 7, 8, 11:
-- Decoupled Loss: l_total = l_noise + 0.1 * l_role + 0.05 * l_host + 0.05 * l_local.
-- l_host: Masked Soft-Target CrossEntropy over host_node_mask.
-- l_local: Pos-Weighted BCE over local_node_mask.
-- Deterministic Validation: torch.Generator(manual_seed=20260725 + b_idx).
-- Cyclic Roll Shuffled Validation: torch.roll(shifts=1).
-- Causal Margin Checkpoint Guard: saves best.pt ONLY when causal_margin = min(gain_vs_base, gain_vs_shuffle) > 0.
-- Saves debug.pt for --debug, last.pt for recovery.
-- Optimizer lr = 3e-4.
+Implements Core Directives:
+- CPU Node Graph Extraction before non_blocking GPU transfer (eliminates .item() GPU sync latency).
+- Dataset-wide Cumulative Metrics: Host Accuracy, Local Micro F1, Role F1s, Stratified Noise MSE (motif vs no-motif).
+- Fixed Half-Batch Cyclic Derangement (shift = max(1, batch_size // 2)).
+- Resume & Epochs CLI arguments (--resume, --epochs 30).
+- Inherits best_causal_margin from existing best.pt to prevent overwriting superior checkpoints.
+- Saves schema_version="prior_face_bbox_v6_1", optimizer_state_dict, best_causal_margin.
 """
 
 from __future__ import annotations
@@ -62,13 +60,26 @@ def run_epoch(
     val_noise_prior = []
     val_noise_shuffled = []
 
-    role_f1_sheet = []
-    role_f1_hole = []
-    role_f1_repeat = []
+    val_noise_motif = []
+    val_noise_no_motif = []
+
+    # Dataset-wide cumulative metric counters (Directive 2 & 3)
+    host_correct_total = 0
+    host_count_total = 0
+
+    local_tp, local_fp, local_fn = 0, 0, 0
+    role_tp = [0, 0, 0]
+    role_fp = [0, 0, 0]
+    role_fn = [0, 0, 0]
 
     for b_idx, cpu_batch in enumerate(loader):
         if max_batches is not None and b_idx >= max_batches:
             break
+
+        # Directive 1: Extract Node Graph on CPU BEFORE moving to GPU!
+        node_graph_cpu = extract_motif_node_graph(cpu_batch["prior"], max_nodes=MAX_MOTIF_NODES)
+        node_graph = {key: val.to(device, non_blocking=True) for key, val in node_graph_cpu.items()}
+
         batch = to_device(cpu_batch, device)
         prior, target = batch["prior"], batch["target"]
 
@@ -79,7 +90,6 @@ def run_epoch(
 
         batch_size = clean_bbox.shape[0]
 
-        # Directive 6: Deterministic Validation Seed Generator
         if is_training:
             timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
             noise = torch.randn_like(clean_bbox)
@@ -90,14 +100,13 @@ def run_epoch(
 
         noisy_bbox = scheduler.add_noise(clean_bbox, noise, timesteps)
 
-        # Extract Motif Node Graph
-        node_graph = extract_motif_node_graph(prior, max_nodes=MAX_MOTIF_NODES)
         node_features = node_graph["node_features"]
         hosted_adj = node_graph["hosted_adj"]
         thin_wall_adj = node_graph["thin_wall_adj"]
         node_mask = node_graph["node_mask"]
         node_roles = node_graph["node_roles"]
         asgn_target = node_graph["assignment_target"]
+        has_motif = node_graph["has_structural_prior"]
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -131,7 +140,7 @@ def run_epoch(
             # 2. Auxiliary Role Classification Loss
             l_role = F.binary_cross_entropy_with_logits(role_logits[face_mask], gt_membership[face_mask])
 
-            # 3. Directive 3: Decoupled Host Loss (Masked Soft-Target CrossEntropy)
+            # 3. Decoupled Host Loss (Masked Soft-Target CrossEntropy)
             valid_node_mask = node_mask.bool()
             host_node_mask = valid_node_mask & ((node_roles == -1) | (node_roles == 0))
             host_mask_exp = host_node_mask.unsqueeze(1).expand(-1, face_mask.shape[1], -1)
@@ -143,7 +152,7 @@ def run_epoch(
             host_loss_per_face = -(host_target_norm * host_log_probs).sum(dim=-1)
             l_host = host_loss_per_face[face_mask].mean()
 
-            # 4. Directive 3: Decoupled Local Loss (Pos-Weighted BCE)
+            # 4. Decoupled Local Loss (Pos-Weighted BCE)
             local_node_mask = valid_node_mask & ((node_roles == 1) | (node_roles == 2))
             local_pair_mask = face_mask.unsqueeze(-1) & local_node_mask.unsqueeze(1)
 
@@ -171,6 +180,15 @@ def run_epoch(
             else:
                 val_noise_prior.append(float(l_noise.detach().cpu()))
 
+                # Stratified Noise MSE (Motif vs No-Motif)
+                for b_i in range(batch_size):
+                    m_idx = face_mask[b_i]
+                    b_mse = float(F.mse_loss(pred_noise[b_i, m_idx], noise[b_i, m_idx]).detach().cpu())
+                    if has_motif[b_i]:
+                        val_noise_motif.append(b_mse)
+                    else:
+                        val_noise_no_motif.append(b_mse)
+
                 # Baseline pass (prior off)
                 model.set_prior(None)
                 pred_base = model(
@@ -184,9 +202,10 @@ def run_epoch(
                 l_base = F.mse_loss(pred_base[face_mask], noise[face_mask])
                 val_noise_baseline.append(float(l_base.detach().cpu()))
 
-                # Directive 6: Cyclic Roll Shuffled Validation
+                # Directive 4: Fixed Half-Batch Cyclic Derangement
                 if batch_size > 1:
-                    perm = torch.roll(torch.arange(batch_size, device=device), shifts=1)
+                    shift = max(1, batch_size // 2)
+                    perm = torch.roll(torch.arange(batch_size, device=device), shifts=shift)
                     shuf_features = node_features[perm]
                     shuf_hosted = hosted_adj[perm]
                     shuf_thin = thin_wall_adj[perm]
@@ -217,17 +236,28 @@ def run_epoch(
                 else:
                     val_noise_shuffled.append(float(l_base.detach().cpu()))
 
-                # Directive 11: Compute Role F1 per category
-                role_preds = (torch.sigmoid(role_logits[face_mask]) > 0.5).float()
-                role_gt = gt_membership[face_mask]
-                for ch, lst in enumerate([role_f1_sheet, role_f1_hole, role_f1_repeat]):
-                    p_ch = role_preds[:, ch]
-                    g_ch = role_gt[:, ch]
-                    tp = (p_ch * g_ch).sum()
-                    fp = (p_ch * (1 - g_ch)).sum()
-                    fn = ((1 - p_ch) * g_ch).sum()
-                    f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
-                    lst.append(f1)
+                # Directive 3: Cumulative Host Accuracy
+                host_pred = host_logits.argmax(dim=-1)  # [b, N_faces]
+                host_correct = (asgn_target.gather(dim=-1, index=host_pred.unsqueeze(-1)).squeeze(-1) > 0)
+                host_correct_total += (host_correct & face_mask).sum().item()
+                host_count_total += face_mask.sum().item()
+
+                # Directive 3: Cumulative Local Micro F1
+                local_pred = (torch.sigmoid(assignment_logits) > 0.5)
+                local_true = (asgn_target > 0.5)
+                local_tp += (local_pred & local_true & local_pair_mask).sum().item()
+                local_fp += (local_pred & (~local_true) & local_pair_mask).sum().item()
+                local_fn += ((~local_pred) & local_true & local_pair_mask).sum().item()
+
+                # Directive 3: Cumulative Role F1s
+                role_pred_bool = (torch.sigmoid(role_logits) > 0.5)
+                role_gt_bool = (gt_membership > 0.5)
+                for ch in range(3):
+                    p_c = role_pred_bool[:, :, ch] & face_mask
+                    g_c = role_gt_bool[:, :, ch] & face_mask
+                    role_tp[ch] += (p_c & g_c).sum().item()
+                    role_fp[ch] += (p_c & (~g_c)).sum().item()
+                    role_fn[ch] += ((~p_c) & g_c).sum().item()
 
         losses_total.append(float(l_total.detach().cpu()))
         losses_noise.append(float(l_noise.detach().cpu()))
@@ -246,13 +276,25 @@ def run_epoch(
         result["val_noise_baseline"] = float(np.mean(val_noise_baseline))
         result["val_noise_prior"] = float(np.mean(val_noise_prior))
         result["val_noise_shuffled"] = float(np.mean(val_noise_shuffled))
+        result["val_noise_motif"] = float(np.mean(val_noise_motif)) if len(val_noise_motif) > 0 else result["val_noise_prior"]
+        result["val_noise_no_motif"] = float(np.mean(val_noise_no_motif)) if len(val_noise_no_motif) > 0 else result["val_noise_prior"]
+
         result["gain_vs_base"] = result["val_noise_baseline"] - result["val_noise_prior"]
         result["gain_vs_shuffle"] = result["val_noise_shuffled"] - result["val_noise_prior"]
         result["causal_margin"] = min(result["gain_vs_base"], result["gain_vs_shuffle"])
-        result["role_f1_sheet"] = float(np.mean(role_f1_sheet))
-        result["role_f1_hole"] = float(np.mean(role_f1_hole))
-        result["role_f1_repeat"] = float(np.mean(role_f1_repeat))
-        result["role_macro_f1"] = float(np.mean([result["role_f1_sheet"], result["role_f1_hole"], result["role_f1_repeat"]]))
+
+        # Cumulative Metrics calculation
+        result["host_accuracy"] = float(host_correct_total / max(host_count_total, 1))
+        result["local_micro_f1"] = float(2 * local_tp / max(2 * local_tp + local_fp + local_fn, 1))
+
+        r_f1s = []
+        for ch in range(3):
+            f1_c = 2 * role_tp[ch] / max(2 * role_tp[ch] + role_fp[ch] + role_fn[ch], 1)
+            r_f1s.append(f1_c)
+        result["role_f1_sheet"] = float(r_f1s[0])
+        result["role_f1_hole"] = float(r_f1s[1])
+        result["role_f1_repeat"] = float(r_f1s[2])
+        result["role_macro_f1"] = float(np.mean(r_f1s))
 
     return result
 
@@ -260,11 +302,13 @@ def run_epoch(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", help="run only 2 batches for fast 5-second debug")
+    parser.add_argument("--resume", type=Path, default=None, help="path to checkpoint to resume training")
+    parser.add_argument("--epochs", type=int, default=30, help="total number of epochs")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 80)
-    print(f"TRAINING CROSS-ATTENTION PRIOR ALLOCATOR V6.1 (Device: {device})")
+    print(f"TRAINING CROSS-ATTENTION PRIOR ALLOCATOR V6.1 FINAL (Device: {device})")
     print("=" * 80)
 
     train_h5 = PACKAGE_ROOT / "data" / "deepcad" / "train.h5"
@@ -278,10 +322,10 @@ def main() -> int:
     val_ds = StagewiseH5Dataset(val_h5, "face_bbox", training=False)
 
     train_loader = DataLoader(
-        train_ds, batch_size=64, shuffle=True, collate_fn=collate_stagewise, pin_memory=True, num_workers=2, persistent_workers=True
+        train_ds, batch_size=64, shuffle=True, collate_fn=collate_stagewise, pin_memory=True, num_workers=0
     )
     val_loader = DataLoader(
-        val_ds, batch_size=64, shuffle=False, collate_fn=collate_stagewise, pin_memory=True, num_workers=2, persistent_workers=True
+        val_ds, batch_size=64, shuffle=False, collate_fn=collate_stagewise, pin_memory=True, num_workers=0
     )
 
     backend = DTGBackend(str(device))
@@ -298,7 +342,6 @@ def main() -> int:
     frozen_params = sum(p.numel() for p in model.base.parameters())
     print(f"Model Parameters: Trainable (PriorAllocator v6.1) = {trainable_params:,}, Frozen (Base) = {frozen_params:,}")
 
-    # Directive 11: Learning Rate set to 3e-4
     optimizer = torch.optim.AdamW(model.prior_allocator.parameters(), lr=3e-4, weight_decay=1e-4)
 
     scheduler = DDPMScheduler(
@@ -312,12 +355,36 @@ def main() -> int:
 
     ckpt_dir = PACKAGE_ROOT / "checkpoints" / "prior_face_bbox"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    start_epoch = 1
     best_causal_margin = -float("inf")
 
-    max_b = 2 if args.debug else None
-    num_epochs = 1 if args.debug else 10
+    # Directive 7: Inherit best_causal_margin from existing best.pt if starting fresh!
+    best_path = ckpt_dir / "best.pt"
+    if best_path.exists() and args.resume is None:
+        try:
+            existing_ckpt = torch.load(best_path, map_location="cpu")
+            best_causal_margin = float(existing_ckpt.get("best_causal_margin", existing_ckpt.get("causal_margin", -float("inf"))))
+            print(f"  [INFO] Inherited Existing best.pt Causal Margin: {best_causal_margin:+.6f}")
+        except Exception as exc:
+            print(f"  [WARN] Failed to read existing best.pt margin: {exc}")
 
-    for epoch in range(1, num_epochs + 1):
+    # Directive 6: Resume training if --resume is provided
+    if args.resume is not None:
+        if not args.resume.exists():
+            raise FileNotFoundError(f"Error: --resume checkpoint not found at {args.resume}!")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.prior_allocator.load_state_dict(ckpt["prior_allocator_state_dict"], strict=True)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_causal_margin = float(ckpt.get("best_causal_margin", ckpt.get("causal_margin", -float("inf"))))
+        print(f"  [SUCCESS] Resumed Training from Epoch {start_epoch} (Best Margin: {best_causal_margin:+.6f})")
+
+    max_b = 2 if args.debug else None
+    num_epochs = 1 if args.debug else int(args.epochs)
+
+    for epoch in range(start_epoch, num_epochs + 1):
         tr = run_epoch(model, train_loader, scheduler, optimizer, device, is_training=True, max_batches=max_b)
         va = run_epoch(model, val_loader, scheduler, optimizer, device, is_training=False, max_batches=max_b)
 
@@ -327,36 +394,46 @@ def main() -> int:
         causal_margin = va.get("causal_margin", 0.0)
 
         print(
-            f"Epoch {epoch:02d}/{num_epochs:02d} | Train Tot: {tr['total']:.4f} (Noise: {tr['noise']:.4f}, Host: {tr['host']:.4f}, Local: {tr['local']:.4f}) | "
+            f"Epoch {epoch:02d}/{num_epochs:02d} | Train Tot: {tr['total']:.4f} | "
             f"Val Noise (Base: {val_base:.4f}, Prior: {val_prior:.4f}, Shuf: {val_shuf:.4f}, Margin: {causal_margin:+.4f}) | "
-            f"Role Macro F1: {va.get('role_macro_f1', 0):.4f}"
+            f"Host Acc: {va.get('host_accuracy', 0):.4f} | Local F1: {va.get('local_micro_f1', 0):.4f} | Role Macro F1: {va.get('role_macro_f1', 0):.4f}"
         )
 
-        # Save last.pt every epoch for interrupt recovery
-        last_path = ckpt_dir / "last.pt"
         ckpt_payload = {
-            "schema_version": "prior_face_bbox_v6",
+            "schema_version": "prior_face_bbox_v6_1",
             "max_nodes": MAX_MOTIF_NODES,
             "epoch": epoch,
             "prior_allocator_state_dict": model.prior_allocator.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_causal_margin": best_causal_margin,
             "val_noise_prior": val_prior,
             "val_noise_baseline": val_base,
             "val_noise_shuffled": val_shuf,
+            "val_noise_motif": va.get("val_noise_motif", val_prior),
+            "val_noise_no_motif": va.get("val_noise_no_motif", val_prior),
             "gain_vs_base": va.get("gain_vs_base", 0.0),
             "gain_vs_shuffle": va.get("gain_vs_shuffle", 0.0),
             "causal_margin": causal_margin,
+            "host_accuracy": va.get("host_accuracy", 0.0),
+            "local_micro_f1": va.get("local_micro_f1", 0.0),
             "role_macro_f1": va.get("role_macro_f1", 0.0),
+            "role_f1_sheet": va.get("role_f1_sheet", 0.0),
+            "role_f1_hole": va.get("role_f1_hole", 0.0),
+            "role_f1_repeat": va.get("role_f1_repeat", 0.0),
         }
+
+        # Save last.pt every epoch
+        last_path = ckpt_dir / "last.pt"
         torch.save(ckpt_payload, last_path)
 
-        # Directive 7: Save best.pt ONLY when causal_margin > 0 and improves over best!
+        # Save best.pt ONLY when causal_margin > 0 and improves over best!
         if args.debug:
             debug_path = ckpt_dir / "debug.pt"
             torch.save(ckpt_payload, debug_path)
             print(f"  --> Saved Debug Checkpoint to {debug_path}")
         elif causal_margin > 0 and causal_margin > best_causal_margin:
             best_causal_margin = causal_margin
-            best_path = ckpt_dir / "best.pt"
+            ckpt_payload["best_causal_margin"] = best_causal_margin
             torch.save(ckpt_payload, best_path)
             print(f"  --> Saved Best Checkpoint based on causal_margin ({causal_margin:+.6f}) to {best_path}")
 
