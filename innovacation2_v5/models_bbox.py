@@ -1,19 +1,19 @@
-"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v5).
+"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v6).
 
-Implements Core Directives 2, 4, 5, 6, 7:
-- MotifNodeEncoder: Node-level features + normalized relation message passing with LayerNorm.
-- TopoFaceEncoder: Fixed graph features (degree, weighted_degree, neighbor_degree_mean, max_multiplicity) + row-normalized GCN.
-- CrossAttentionAllocator:
-  - Multi-Head Cross-Attention with Background Node 0 (never masked out).
-  - assignment_logits [B, N_faces, max_nodes] for instance-level multi-hot supervision.
-  - Hybrid allocation heads: Softmax for sheet/background nodes, Sigmoid for hole/repeat nodes.
-  - Role classification head predicting 3-class role_logits [B, N_faces, 3].
-- Unified PriorAllocator module.
+Implements Core Directives 1, 2, 4, 5, 7:
+- Pairwise Dot-Product assignment_head: (face_query @ node_key.T) / sqrt(d).
+- Dual Allocation Branches (node_roles aware):
+  - Host Branch (background 0 + sheet nodes): Masked Softmax -> host_context.
+  - Local Branch (hole & repeat nodes): Sigmoid -> local_context.
+  - Fusion via mlp_fuse(concat([host_context, local_context])).
+- Fixed TopoFaceEncoder: Neighbor degree mean calculated on unscaled raw degrees first.
+- Unified PriorAllocator module with max_nodes = 64.
 """
 
 from __future__ import annotations
 
 import sys
+import math
 from pathlib import Path
 from typing import Optional, Dict, Tuple, Any
 import torch
@@ -64,11 +64,10 @@ class MotifNodeEncoder(nn.Module):
 
 
 class TopoFaceEncoder(nn.Module):
-    """Directive 5: 2-layer GCN Encoder for generated fef_adj topology with fixed node features."""
+    """Directive 4: 2-layer GCN Encoder for generated fef_adj topology with raw-degree neighbor calculation."""
 
     def __init__(self, embed_dim: int = 512):
         super().__init__()
-        # Initial feature dimension: degree (1), weighted_degree (1), neighbor_degree_mean (1), max_multiplicity (1)
         self.input_proj = nn.Linear(4, 128)
         self.layer1 = nn.Linear(128, 256)
         self.layer2 = nn.Linear(256, embed_dim)
@@ -80,10 +79,17 @@ class TopoFaceEncoder(nn.Module):
         A_weight = fef_adj.float()
         A_binary = (fef_adj > 0).float()
 
-        degree = A_binary.sum(dim=-1, keepdim=True) / 10.0  # [b, N_faces, 1]
-        weighted_degree = A_weight.sum(dim=-1, keepdim=True) / 20.0  # [b, N_faces, 1]
-        neighbor_degree_mean = torch.bmm(A_binary, degree) / (degree.clamp_min(1.0) * 10.0)  # [b, N_faces, 1]
-        max_multiplicity = A_weight.max(dim=-1, keepdim=True).values / 5.0  # [b, N_faces, 1]
+        # Directive 4: Compute unscaled raw features FIRST!
+        degree_raw = A_binary.sum(dim=-1, keepdim=True)
+        weighted_degree_raw = A_weight.sum(dim=-1, keepdim=True)
+        neighbor_degree_mean_raw = torch.bmm(A_binary, degree_raw) / (degree_raw.clamp_min(1.0))
+        max_multiplicity_raw = A_weight.max(dim=-1, keepdim=True).values
+
+        # Normalize features individually
+        degree = degree_raw / 10.0
+        weighted_degree = weighted_degree_raw / 20.0
+        neighbor_degree_mean = neighbor_degree_mean_raw / 10.0
+        max_multiplicity = max_multiplicity_raw / 5.0
 
         x0 = torch.cat([degree, weighted_degree, neighbor_degree_mean, max_multiplicity], dim=-1)
         x0 = x0 * face_mask.unsqueeze(-1).float()
@@ -106,9 +112,9 @@ class TopoFaceEncoder(nn.Module):
 
 
 class CrossAttentionAllocator(nn.Module):
-    """Directive 3, 6, 7: Multi-Head Cross-Attention Allocator with Hybrid Instance Assignment & Role Heads."""
+    """Directive 1, 2: Pairwise Dot-Product assignment_head & Dual-Branch (Host/Local) Context Fusion."""
 
-    def __init__(self, embed_dim: int = 512, max_nodes: int = 32, num_heads: int = 4):
+    def __init__(self, embed_dim: int = 512, max_nodes: int = 64, num_heads: int = 4):
         super().__init__()
         self.max_nodes = max_nodes
         self.attn = nn.MultiheadAttention(
@@ -117,18 +123,22 @@ class CrossAttentionAllocator(nn.Module):
             batch_first=True,
         )
 
-        # Instance Assignment Head [B, N_faces, max_nodes]
-        self.assignment_head = nn.Sequential(
-            nn.Linear(embed_dim, 128),
-            nn.SiLU(),
-            nn.Linear(128, max_nodes),
-        )
+        # Directive 1: Pairwise Dot-Product Assignment Head
+        self.assignment_q = nn.Linear(embed_dim, 128)
+        self.assignment_k = nn.Linear(embed_dim, 128)
 
         # Role Classification Head [B, N_faces, 3] (sheet, hole, repeat)
         self.role_head = nn.Sequential(
             nn.Linear(embed_dim, 64),
             nn.SiLU(),
             nn.Linear(64, 3),
+        )
+
+        # Directive 2: Dual Branch Fusion MLP (Concat host_context [512] + local_context [512] -> 512)
+        self.mlp_fuse = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
         )
 
         # Zero-initialization for residual prior projection
@@ -143,13 +153,14 @@ class CrossAttentionAllocator(nn.Module):
         V: torch.Tensor,
         face_mask: torch.Tensor,
         node_mask: torch.Tensor,
+        node_roles: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Q: [b, N_faces, 512]
         # K, V: [b, N_nodes, 512]
         # face_mask: [b, N_faces]
-        # node_mask: [b, N_nodes] (node 0 is always True)
+        # node_mask: [b, N_nodes] (node 0 background is always True)
+        # node_roles: [b, N_nodes] (-1: background, 0: sheet, 1: hole, 2: repeat)
 
-        # Key Padding Mask (True means invalid/padded)
         key_padding_mask = ~node_mask  # [b, N_nodes]
 
         attn_out, _ = self.attn(
@@ -162,27 +173,36 @@ class CrossAttentionAllocator(nn.Module):
         # 1. Role Logits [B, N_faces, 3]
         role_logits = self.role_head(attn_out)
 
-        # 2. Assignment Logits [B, N_faces, max_nodes]
-        assignment_logits = self.assignment_head(attn_out)
+        # 2. Directive 1: Pairwise Dot-Product Assignment Logits [B, N_faces, N_nodes]
+        fq = self.assignment_q(Q)  # [b, N_faces, 128]
+        nk = self.assignment_k(K)  # [b, N_nodes, 128]
+        assignment_logits = torch.bmm(fq, nk.transpose(1, 2)) / math.sqrt(128.0)  # [b, N_faces, N_nodes]
 
-        # 3. Hybrid Allocation Weights over V
-        # Node 0 (background) and Sheet nodes use Softmax over node dim; Hole/Repeat use Sigmoid
-        probs_softmax = F.softmax(assignment_logits, dim=-1)  # [b, N_faces, max_nodes]
-        probs_sigmoid = torch.sigmoid(assignment_logits)
+        # 3. Directive 2: Dual Branch Allocation Probabilities over V
+        b_size, n_faces, n_nodes = assignment_logits.shape
 
-        # Combine: Node 0 & Sheet -> Softmax; Hole/Repeat -> Sigmoid
-        alloc_probs = probs_softmax.clone()
-        alloc_probs[:, :, 1:] = probs_sigmoid[:, :, 1:]
+        # Host Mask: Background (-1) and Sheet (0) nodes
+        host_node_mask = (node_roles == -1) | (node_roles == 0)  # [b, N_nodes]
+        host_mask_expanded = host_node_mask.unsqueeze(1).expand(-1, n_faces, -1)  # [b, N_faces, N_nodes]
 
-        # Mask out invalid key nodes in allocation probabilities
-        alloc_probs = alloc_probs * node_mask.unsqueeze(1).float()
-        alloc_probs = alloc_probs / alloc_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        # Local Mask: Hole (1) and Repeat (2) nodes
+        local_node_mask = (node_roles == 1) | (node_roles == 2)  # [b, N_nodes]
+        local_mask_expanded = local_node_mask.unsqueeze(1).expand(-1, n_faces, -1)  # [b, N_faces, N_nodes]
 
-        # Weighted aggregation of V
-        prior_context = torch.bmm(alloc_probs, V)  # [b, N_faces, 512]
+        # Branch 1: Host Branch (Masked Softmax)
+        host_logits = assignment_logits.masked_fill(~host_mask_expanded, -1e9)
+        host_probs = F.softmax(host_logits, dim=-1) * host_mask_expanded.float()
+        host_context = torch.bmm(host_probs, V)  # [b, N_faces, 512]
+
+        # Branch 2: Local Branch (Sigmoid Multi-Label)
+        local_probs = torch.sigmoid(assignment_logits) * local_mask_expanded.float()
+        local_context = torch.bmm(local_probs, V)  # [b, N_faces, 512]
+
+        # Directive 2: Fusion without unified normalization!
+        fused_context = self.mlp_fuse(torch.cat([host_context, local_context], dim=-1))
 
         # Zero-projected residual prior
-        per_face_prior = self.zero_proj(prior_context)  # [b, N_faces, 512]
+        per_face_prior = self.zero_proj(fused_context)  # [b, N_faces, 512]
         per_face_prior = per_face_prior * face_mask.unsqueeze(-1).float()
 
         return per_face_prior, role_logits, assignment_logits
@@ -191,7 +211,7 @@ class CrossAttentionAllocator(nn.Module):
 class PriorAllocator(nn.Module):
     """Unified PriorAllocator Module encapsulating NodeEncoder, TopoEncoder, and Allocator."""
 
-    def __init__(self, embed_dim: int = 512, max_nodes: int = 32):
+    def __init__(self, embed_dim: int = 512, max_nodes: int = 64):
         super().__init__()
         self.node_encoder = MotifNodeEncoder(node_in_dim=11, embed_dim=embed_dim)
         self.topo_encoder = TopoFaceEncoder(embed_dim=embed_dim)
@@ -203,12 +223,13 @@ class PriorAllocator(nn.Module):
         hosted_adj: torch.Tensor,
         thin_wall_adj: torch.Tensor,
         node_mask: torch.Tensor,
+        node_roles: torch.Tensor,
         fef_adj: torch.Tensor,
         face_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         K, V = self.node_encoder(node_features, hosted_adj, thin_wall_adj, node_mask)
         Q = self.topo_encoder(fef_adj, face_mask)
-        per_face_prior, role_logits, assignment_logits = self.allocator(Q, K, V, face_mask, node_mask)
+        per_face_prior, role_logits, assignment_logits = self.allocator(Q, K, V, face_mask, node_mask, node_roles)
         return per_face_prior, role_logits, assignment_logits
 
 
@@ -245,7 +266,7 @@ class GuidedMLPInX(nn.Module):
 class PriorFaceBboxModel(nn.Module):
     """Wrapper around official DTG FaceBboxTransformer to inject per_face_prior embeddings."""
 
-    def __init__(self, base_model: nn.Module, embed_dim: int = 512, max_nodes: int = 32):
+    def __init__(self, base_model: nn.Module, embed_dim: int = 512, max_nodes: int = 64):
         super().__init__()
         self.base = base_model
         self.prior_allocator = PriorAllocator(embed_dim=embed_dim, max_nodes=max_nodes)
@@ -283,5 +304,5 @@ def build_prior_face_bbox_model(official_model: nn.Module) -> PriorFaceBboxModel
     elif hasattr(official_model, "d_model"):
         embed_dim = official_model.d_model
 
-    model = PriorFaceBboxModel(official_model, embed_dim=embed_dim, max_nodes=32)
+    model = PriorFaceBboxModel(official_model, embed_dim=embed_dim, max_nodes=64)
     return model
