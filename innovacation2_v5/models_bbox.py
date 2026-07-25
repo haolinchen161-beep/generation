@@ -1,15 +1,9 @@
-"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v6.1).
+"""PriorFaceBboxModel: Cross-Attention Face Role & Instance Allocator Architecture (v6.1 Final).
 
-Implements Core Directives 1, 2, 4, 5, 7:
-- MAX_MOTIF_NODES = 96.
-- MotifNodeEncoder: Projects K & V and masks with node_mask to eliminate linear projection bias on padding nodes.
-- Pairwise Dot-Product assignment_head with invalid node masked_fill(-1e4).
-- Node Role Filters:
-  - host_node_mask = valid_node_mask & ((node_roles == -1) | (node_roles == 0))
-  - local_node_mask = valid_node_mask & ((node_roles == 1) | (node_roles == 2))
-- Host Branch: Masked Softmax -> host_context.
-- Local Branch: Sigmoid normalized by local_mass (local_probs.sum(-1, keepdim=True).clamp_min(1.0)) -> local_context.
-- Fusion: mlp_fuse(concat([host_context, local_context])) -> zero_proj -> per_face_prior.
+Implements Core Directives:
+- TopoFaceEncoder: Q multiplied by face_mask after q_proj to eliminate padding face bias.
+- Host Softmax: re-normalized by sum to guarantee strict numerical sum-to-1 probability distribution.
+- K/V masking, Invalid Node Logit masking (-1e4), Local Mass Normalization.
 """
 
 from __future__ import annotations
@@ -31,7 +25,7 @@ MAX_MOTIF_NODES = 96
 
 
 class MotifNodeEncoder(nn.Module):
-    """Directive 2 & 4: Encodes Motif Graph Nodes with LayerNorm & Row-Normalized Relation Message Passing."""
+    """Encodes Motif Graph Nodes with LayerNorm & Row-Normalized Relation Message Passing."""
 
     def __init__(self, node_in_dim: int = 11, embed_dim: int = 512):
         super().__init__()
@@ -50,10 +44,6 @@ class MotifNodeEncoder(nn.Module):
         thin_wall_adj: torch.Tensor,
         node_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # node_features: [b, N_nodes, 11]
-        # hosted_adj:    [b, N_nodes, N_nodes] (row-normalized)
-        # thin_wall_adj: [b, N_nodes, N_nodes] (row-normalized)
-        # node_mask:     [b, N_nodes]
         h = self.node_proj(node_features)  # [b, N_nodes, 512]
 
         m_hosted = torch.bmm(hosted_adj, self.hosted_proj(h))
@@ -64,7 +54,7 @@ class MotifNodeEncoder(nn.Module):
         K = self.k_proj(h_rel)
         V = self.v_proj(h_rel)
 
-        # Directive 1: Multiply K & V by node_mask AFTER linear projection to eliminate bias leakage on padding nodes!
+        # Multiply K & V by node_mask AFTER linear projection to eliminate bias leakage on padding nodes!
         mask = node_mask.unsqueeze(-1).to(K.dtype)
         K = K * mask
         V = V * mask
@@ -72,7 +62,7 @@ class MotifNodeEncoder(nn.Module):
 
 
 class TopoFaceEncoder(nn.Module):
-    """Directive 4: 2-layer GCN Encoder for generated fef_adj topology with raw-degree neighbor calculation."""
+    """2-layer GCN Encoder for generated fef_adj topology with padding face q_proj masking."""
 
     def __init__(self, embed_dim: int = 512):
         super().__init__()
@@ -82,12 +72,10 @@ class TopoFaceEncoder(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, fef_adj: torch.Tensor, face_mask: torch.Tensor) -> torch.Tensor:
-        # fef_adj:   [b, N_faces, N_faces]
-        # face_mask: [b, N_faces]
         A_weight = fef_adj.float()
         A_binary = (fef_adj > 0).float()
 
-        # Directive 4: Compute unscaled raw features FIRST!
+        # Compute unscaled raw features FIRST
         degree_raw = A_binary.sum(dim=-1, keepdim=True)
         weighted_degree_raw = A_weight.sum(dim=-1, keepdim=True)
         neighbor_degree_mean_raw = torch.bmm(A_binary, degree_raw) / (degree_raw.clamp_min(1.0))
@@ -115,12 +103,14 @@ class TopoFaceEncoder(nn.Module):
         h2 = F.silu(self.layer2(h1 + m2))
 
         h2 = h2 * face_mask.unsqueeze(-1).float()
-        Q = self.q_proj(h2)  # [b, N_faces, 512]
+
+        # Directive 2: Multiply Q by face_mask AFTER q_proj to eliminate bias leakage on padding faces!
+        Q = self.q_proj(h2) * face_mask.unsqueeze(-1).float()  # [b, N_faces, 512]
         return Q
 
 
 class CrossAttentionAllocator(nn.Module):
-    """Directive 1, 2, 4: Pairwise Dot-Product assignment_head & Dual-Branch (Host/Local) Context Fusion."""
+    """Pairwise Dot-Product assignment_head & Dual-Branch (Host/Local) Context Fusion."""
 
     def __init__(self, embed_dim: int = 512, max_nodes: int = MAX_MOTIF_NODES, num_heads: int = 4):
         super().__init__()
@@ -131,7 +121,6 @@ class CrossAttentionAllocator(nn.Module):
             batch_first=True,
         )
 
-        # Directive 1: Pairwise Dot-Product Assignment Head
         self.assignment_q = nn.Linear(embed_dim, 128)
         self.assignment_k = nn.Linear(embed_dim, 128)
 
@@ -142,7 +131,7 @@ class CrossAttentionAllocator(nn.Module):
             nn.Linear(64, 3),
         )
 
-        # Directive 2: Dual Branch Fusion MLP (Concat host_context [512] + local_context [512] -> 512)
+        # Dual Branch Fusion MLP
         self.mlp_fuse = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
             nn.SiLU(),
@@ -163,12 +152,6 @@ class CrossAttentionAllocator(nn.Module):
         node_mask: torch.Tensor,
         node_roles: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Q: [b, N_faces, 512]
-        # K, V: [b, N_nodes, 512]
-        # face_mask: [b, N_faces]
-        # node_mask: [b, N_nodes] (node 0 background is always True)
-        # node_roles: [b, N_nodes] (-2: pad, -1: background, 0: sheet, 1: hole, 2: repeat)
-
         key_padding_mask = ~node_mask  # [b, N_nodes]
 
         attn_out, _ = self.attn(
@@ -186,13 +169,13 @@ class CrossAttentionAllocator(nn.Module):
         nk = self.assignment_k(K)  # [b, N_nodes, 128]
         assignment_logits = torch.bmm(fq, nk.transpose(1, 2)) / math.sqrt(128.0)  # [b, N_faces, N_nodes]
 
-        # Directive 1: Mask out invalid nodes in assignment_logits
+        # Mask out invalid nodes in assignment_logits
         assignment_logits = assignment_logits.masked_fill(~node_mask.unsqueeze(1), -1e4)
 
-        # 3. Directive 1 & 2: Node Role Filters
+        # 3. Node Role Filters
         valid_node_mask = node_mask.bool()  # [b, N_nodes]
 
-        # Host Mask: Background (-1) and Sheet (0) nodes ONLY! (Excludes padding -2 and hole/repeat)
+        # Host Mask: Background (-1) and Sheet (0) nodes ONLY!
         host_node_mask = valid_node_mask & ((node_roles == -1) | (node_roles == 0))
         host_mask_expanded = host_node_mask.unsqueeze(1).expand(-1, Q.shape[1], -1)
 
@@ -200,19 +183,19 @@ class CrossAttentionAllocator(nn.Module):
         local_node_mask = valid_node_mask & ((node_roles == 1) | (node_roles == 2))
         local_mask_expanded = local_node_mask.unsqueeze(1).expand(-1, Q.shape[1], -1)
 
-        # Branch 1: Host Branch (Masked Softmax over Host nodes)
+        # Branch 1: Host Branch (Masked Softmax over Host nodes, re-normalized)
         host_logits = assignment_logits.masked_fill(~host_mask_expanded, -1e4)
         host_probs = F.softmax(host_logits, dim=-1) * host_mask_expanded.float()
+        # Directive 3: Re-normalize by sum to guarantee strict numerical probability sum = 1
+        host_probs = host_probs / host_probs.sum(dim=-1, keepdim=True).clamp_min(1.0)
         host_context = torch.bmm(host_probs, V)  # [b, N_faces, 512]
 
         # Branch 2: Local Branch (Sigmoid Multi-Label normalized by local_mass)
         local_probs = torch.sigmoid(assignment_logits) * local_mask_expanded.float()
-
-        # Directive 4: Normalize by local_mass to prevent amplitude explosion!
         local_mass = local_probs.sum(dim=-1, keepdim=True).clamp_min(1.0)
         local_context = torch.bmm(local_probs, V) / local_mass  # [b, N_faces, 512]
 
-        # Directive 2: Dual Branch Fusion without unified normalization
+        # Dual Branch Fusion
         fused_context = self.mlp_fuse(torch.cat([host_context, local_context], dim=-1))
 
         # Zero-projected residual prior
