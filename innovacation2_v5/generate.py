@@ -1,10 +1,11 @@
-"""Generate matched 3D CAD models using PriorFaceBbox (Strict Paired Control Benchmark v6).
+"""Generate matched 3D CAD models using PriorFaceBbox (Strict Paired Control Benchmark v6.1).
 
 Implements Core Directives 8, 9, 10:
-- Fully compliant with evaluate.py (includes protocol.prior_rows, stage success flags, prior_uid).
-- Single PriorFaceBboxModel instance used for both baseline (gate 0) and prior (gate 1) branches.
-- Raises FileNotFoundError if best.pt checkpoint is missing.
-- Rejects generated topologies with face count gap |N_gen - N_prior| > 2.
+- MAX_MOTIF_NODES = 96.
+- Strict Checkpoint Schema Verification (schema_version == "prior_face_bbox_v6", max_nodes == 96).
+- Rejects candidate topologies if face_count_gap > 2 after 10 attempts (no fallback candidate!).
+- Per-sample try/except/finally architecture with atomic summary saving for interrupt recovery.
+- Maintains 100% paired record symmetry between dtg (prior_gate=0) and motif (prior_gate=1).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from OCC.Extend.DataExchange import read_step_file, write_step_file, write_stl_f
 from inference.generate import get_brep
 
 from .data import StagewiseH5Dataset
-from .data_bbox import extract_motif_node_graph
+from .data_bbox import extract_motif_node_graph, MAX_MOTIF_NODES
 from .dtg_backend import DTGBackend, checkpoint_checksums
 from .metrics import shape_validity
 from .models_bbox import build_prior_face_bbox_model
@@ -155,25 +156,77 @@ def generate_paired_benchmark(
     face_edge_model = backend.load_face_edge()
     base_bbox_model = backend.load_face_bbox()
 
-    # Directive 10: Checkpoint Assertion!
+    # Directive 10: Strict Checkpoint Verification!
     ckpt_path = PACKAGE_ROOT / "checkpoints" / "prior_face_bbox" / "best.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Error: Trained PriorAllocator checkpoint NOT found at {ckpt_path}! Train first via python -m innovation2_z.train_prior_bbox.")
 
-    prior_bbox_model = build_prior_face_bbox_model(base_bbox_model).to(backend.device)
     checkpoint = torch.load(ckpt_path, map_location=backend.device)
-    if "prior_allocator_state_dict" in checkpoint:
-        prior_bbox_model.prior_allocator.load_state_dict(checkpoint["prior_allocator_state_dict"])
-        print(f"  [SUCCESS] Loaded Trained PriorAllocator v6 Checkpoint from: {ckpt_path}")
+
+    if "prior_allocator_state_dict" not in checkpoint:
+        raise KeyError(f"Error: Checkpoint at {ckpt_path} does not contain 'prior_allocator_state_dict'!")
+
+    if checkpoint.get("schema_version") != "prior_face_bbox_v6":
+        raise ValueError(f"Error: Incompatible checkpoint schema version '{checkpoint.get('schema_version')}'!")
+
+    if int(checkpoint.get("max_nodes", -1)) != MAX_MOTIF_NODES:
+        raise ValueError(f"Error: Checkpoint max_nodes ({checkpoint.get('max_nodes')}) mismatch with current MAX_MOTIF_NODES ({MAX_MOTIF_NODES})!")
+
+    prior_bbox_model = build_prior_face_bbox_model(base_bbox_model).to(backend.device)
+    prior_bbox_model.prior_allocator.load_state_dict(checkpoint["prior_allocator_state_dict"], strict=True)
+    print(f"  [SUCCESS] Loaded Verified PriorAllocator v6.1 Checkpoint from: {ckpt_path}")
 
     prior_bbox_model.eval()
 
     dtg_records: List[Dict[str, Any]] = []
     motif_records: List[Dict[str, Any]] = []
 
+    # Restore existing records for resume
+    dtg_summary_path = dtg_dir / "batch_summary.json"
+    motif_summary_path = motif_dir / "batch_summary.json"
+
+    completed_set = set()
+    if dtg_summary_path.exists() and motif_summary_path.exists():
+        try:
+            with dtg_summary_path.open("r", encoding="utf-8") as h:
+                dtg_records = json.load(h).get("records", [])
+            with motif_summary_path.open("r", encoding="utf-8") as h:
+                motif_records = json.load(h).get("records", [])
+            completed_set = {rec["sample_index"] for rec in dtg_records}
+        except Exception:
+            dtg_records, motif_records, completed_set = [], [], set()
+
+    protocol = {
+        "prior_rows": prior_rows,
+        "base_seed": int(args.seed),
+        "requests": int(args.requests),
+        "paired": True,
+    }
+
+    def save_summaries():
+        _write_json_atomic(dtg_summary_path, {
+            "schema_version": "innovation2_generation_batch_v1",
+            "method": "dtg",
+            "protocol": protocol,
+            "requested": int(args.requests),
+            "completed": len(dtg_records),
+            "records": dtg_records,
+        })
+        _write_json_atomic(motif_summary_path, {
+            "schema_version": "innovation2_generation_batch_v1",
+            "method": "motif",
+            "protocol": protocol,
+            "requested": int(args.requests),
+            "completed": len(motif_records),
+            "records": motif_records,
+        })
+
     bbox_scaled = float(config.get("data", {}).get("bbox_scaled", 3.0))
 
     for sample_index in range(int(args.requests)):
+        if sample_index in completed_set:
+            continue
+
         sample_seed = int(args.seed) + sample_index
         _seed(sample_seed)
 
@@ -186,36 +239,7 @@ def generate_paired_benchmark(
         prior = item["prior"]
         prior_faces = int(item["num_faces"])
 
-        # Directive 9: Strictly reject topology candidate if face count gap |N_gen - N_prior| > 2
-        fef = None
-        face_gap = 0
-        for attempt in range(10):
-            fef_candidate = backend.sample_fef_baseline(face_edge_model)
-            gen_faces = int(fef_candidate.shape[0])
-            face_gap = abs(gen_faces - prior_faces)
-            if face_gap <= 2:
-                fef = fef_candidate
-                break
-        if fef is None:
-            fef = fef_candidate  # Fallback to candidate if 10 attempts fail
-
-        topology = backend.complete_edge_vertex(
-            fef, attempts=int(config["generation"]["edge_vert_attempts"])
-        )
-
-        # Save RNG states right before geometry generation
-        torch_state = torch.get_rng_state()
-        cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-        np_state = np.random.get_state()
-        py_state = random.getstate()
-
-        # Directive 10: Both Baseline & Prior branches use the SAME PriorFaceBboxModel instance!
-        # --- Branch 1: Baseline (prior_gate = 0.0) ---
-        prior_bbox_model.set_prior(None)
-        geom_base = backend.generate_geometry(topology, prior=prior, prior_bbox_model=prior_bbox_model)
-        res_base = _reconstruct_and_export(dtg_run_dir, topology, geom_base, bbox_scaled)
-
-        # Directive 8: Complete Manifest Record Fields for evaluate.py
+        # Base record structure
         rec_base = {
             "sample_index": sample_index,
             "seed": sample_seed,
@@ -225,48 +249,15 @@ def generate_paired_benchmark(
             "prior_dataset_index": int(prior_rows[sample_index]),
             "prior_hdf5_row": int(item["row"]),
             "prior_num_faces": prior_faces,
-            "generated_num_faces": int(fef.shape[0]),
-            "face_count_gap": face_gap,
-            "face_edge_success": True,
-            "edge_vert_success": True,
-            "geometry_success": True,
-            **res_base,
+            "generated_num_faces": None,
+            "face_count_gap": None,
+            "face_edge_success": False,
+            "edge_vert_success": False,
+            "geometry_success": False,
+            "step_written": False,
+            "stl_written": False,
+            "watertight_valid": False,
         }
-        dtg_records.append(rec_base)
-        _write_json_atomic(dtg_run_dir / "trace.json", rec_base)
-
-        # --- Branch 2: Our PriorAllocator (prior_gate = 1.0) ---
-        # Restore EXACT RNG states
-        torch.set_rng_state(torch_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state(cuda_state)
-        np.random.set_state(np_state)
-        random.setstate(py_state)
-
-        batch_prior = {
-            key: (val.unsqueeze(0) if val.ndim > 0 else val.reshape(1)).to(backend.device)
-            for key, val in prior.items()
-        }
-        node_graph = extract_motif_node_graph(batch_prior, max_nodes=64)
-        fef_tensor = torch.as_tensor(fef, dtype=torch.long, device=backend.device).unsqueeze(0)
-        gen_mask = torch.ones((1, fef.shape[0]), dtype=torch.bool, device=backend.device)
-
-        with torch.no_grad():
-            per_face_prior, _, _ = prior_bbox_model.prior_allocator(
-                node_graph["node_features"],
-                node_graph["hosted_adj"],
-                node_graph["thin_wall_adj"],
-                node_graph["node_mask"],
-                node_graph["node_roles"],
-                fef_tensor,
-                gen_mask,
-            )
-            prior_bbox_model.set_prior(per_face_prior)
-
-        geom_motif = backend.generate_geometry(topology, prior=prior, prior_bbox_model=prior_bbox_model)
-        prior_bbox_model.set_prior(None)
-
-        res_motif = _reconstruct_and_export(motif_run_dir, topology, geom_motif, bbox_scaled)
         rec_motif = {
             "sample_index": sample_index,
             "seed": sample_seed,
@@ -276,58 +267,123 @@ def generate_paired_benchmark(
             "prior_dataset_index": int(prior_rows[sample_index]),
             "prior_hdf5_row": int(item["row"]),
             "prior_num_faces": prior_faces,
-            "generated_num_faces": int(fef.shape[0]),
-            "face_count_gap": face_gap,
-            "face_edge_success": True,
-            "edge_vert_success": True,
-            "geometry_success": True,
-            **res_motif,
+            "generated_num_faces": None,
+            "face_count_gap": None,
+            "face_edge_success": False,
+            "edge_vert_success": False,
+            "geometry_success": False,
+            "step_written": False,
+            "stl_written": False,
+            "watertight_valid": False,
         }
-        motif_records.append(rec_motif)
-        _write_json_atomic(motif_run_dir / "trace.json", rec_motif)
 
-        print(
-            "PAIRED SAMPLE %d/%d (Seed: %d) | Face Gap: %d | DTG Step: %s | Motif Step: %s"
-            % (
-                sample_index + 1,
-                args.requests,
-                sample_seed,
-                face_gap,
-                rec_base.get("step_written", False),
-                rec_motif.get("step_written", False),
-            ),
-            flush=True,
-        )
+        # Directive 9: Try / Except / Finally Architecture
+        try:
+            # Stage 1: FaceEdge sampling with face_count_gap <= 2 restriction
+            fef = None
+            face_gap = 0
+            for attempt in range(10):
+                fef_candidate = backend.sample_fef_baseline(face_edge_model)
+                gen_faces = int(fef_candidate.shape[0])
+                face_gap = abs(gen_faces - prior_faces)
+                if face_gap <= 2:
+                    fef = fef_candidate
+                    break
+
+            # Directive 8: If 10 attempts fail, reject sample and continue!
+            if fef is None:
+                rec_base["failure_stage"] = "compatible_face_count_topology"
+                rec_base["error"] = "no topology with face_count_gap <= 2 after 10 attempts"
+                rec_motif["failure_stage"] = "compatible_face_count_topology"
+                rec_motif["error"] = "no topology with face_count_gap <= 2 after 10 attempts"
+                continue
+
+            rec_base["face_edge_success"] = True
+            rec_motif["face_edge_success"] = True
+            rec_base["generated_num_faces"] = int(fef.shape[0])
+            rec_motif["generated_num_faces"] = int(fef.shape[0])
+            rec_base["face_count_gap"] = face_gap
+            rec_motif["face_count_gap"] = face_gap
+
+            # Stage 2: EdgeVert Completion
+            topology = backend.complete_edge_vertex(
+                fef, attempts=int(config["generation"]["edge_vert_attempts"])
+            )
+            rec_base["edge_vert_success"] = True
+            rec_motif["edge_vert_success"] = True
+
+            # Save RNG states before geometry generation
+            torch_state = torch.get_rng_state()
+            cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            np_state = np.random.get_state()
+            py_state = random.getstate()
+
+            # --- Branch 1: Baseline (prior_gate = 0.0) ---
+            prior_bbox_model.set_prior(None)
+            geom_base = backend.generate_geometry(topology, prior=prior, prior_bbox_model=prior_bbox_model)
+            rec_base["geometry_success"] = True
+            res_base = _reconstruct_and_export(dtg_run_dir, topology, geom_base, bbox_scaled)
+            rec_base.update(res_base)
+            _write_json_atomic(dtg_run_dir / "trace.json", rec_base)
+
+            # --- Branch 2: Our PriorAllocator (prior_gate = 1.0) ---
+            # Restore EXACT RNG states
+            torch.set_rng_state(torch_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state(cuda_state)
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+
+            batch_prior = {
+                key: (val.unsqueeze(0) if val.ndim > 0 else val.reshape(1)).to(backend.device)
+                for key, val in prior.items()
+            }
+            node_graph = extract_motif_node_graph(batch_prior, max_nodes=MAX_MOTIF_NODES)
+            fef_tensor = torch.as_tensor(fef, dtype=torch.long, device=backend.device).unsqueeze(0)
+            gen_mask = torch.ones((1, fef.shape[0]), dtype=torch.bool, device=backend.device)
+
+            with torch.no_grad():
+                per_face_prior, _, _ = prior_bbox_model.prior_allocator(
+                    node_graph["node_features"],
+                    node_graph["hosted_adj"],
+                    node_graph["thin_wall_adj"],
+                    node_graph["node_mask"],
+                    node_graph["node_roles"],
+                    fef_tensor,
+                    gen_mask,
+                )
+                prior_bbox_model.set_prior(per_face_prior)
+
+            geom_motif = backend.generate_geometry(topology, prior=prior, prior_bbox_model=prior_bbox_model)
+            rec_motif["geometry_success"] = True
+            res_motif = _reconstruct_and_export(motif_run_dir, topology, geom_motif, bbox_scaled)
+            rec_motif.update(res_motif)
+            _write_json_atomic(motif_run_dir / "trace.json", rec_motif)
+
+            print(
+                "PAIRED SAMPLE %d/%d (Seed: %d) | Gap: %d | DTG STEP: %s | Motif STEP: %s"
+                % (
+                    sample_index + 1,
+                    args.requests,
+                    sample_seed,
+                    face_gap,
+                    rec_base.get("step_written", False),
+                    rec_motif.get("step_written", False),
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            rec_base["error"] = "%s: %s" % (type(exc).__name__, exc)
+            rec_motif["error"] = "%s: %s" % (type(exc).__name__, exc)
+        finally:
+            # Directive 9: ALWAYS clear prior and update atomic summaries
+            prior_bbox_model.set_prior(None)
+            dtg_records.append(rec_base)
+            motif_records.append(rec_motif)
+            save_summaries()
 
     backend.release(face_edge_model)
-
-    # Directive 8: Complete Manifest Protocol Output
-    protocol = {
-        "prior_rows": prior_rows,
-        "base_seed": int(args.seed),
-        "requests": int(args.requests),
-        "paired": True,
-    }
-    dtg_summary = {
-        "schema_version": "innovation2_generation_batch_v1",
-        "method": "dtg",
-        "protocol": protocol,
-        "requested": int(args.requests),
-        "completed": len(dtg_records),
-        "records": dtg_records,
-    }
-    motif_summary = {
-        "schema_version": "innovation2_generation_batch_v1",
-        "method": "motif",
-        "protocol": protocol,
-        "requested": int(args.requests),
-        "completed": len(motif_records),
-        "records": motif_records,
-    }
-    _write_json_atomic(dtg_dir / "batch_summary.json", dtg_summary)
-    _write_json_atomic(motif_dir / "batch_summary.json", motif_summary)
-
-    return {"dtg": dtg_summary, "motif": motif_summary}
+    return {"dtg": dtg_records, "motif": motif_records}
 
 
 def run_pilot(args: argparse.Namespace) -> Dict[str, Any]:
@@ -345,7 +401,7 @@ def run_pilot(args: argparse.Namespace) -> Dict[str, Any]:
     rows = _prior_plan(prior_dataset, int(args.requests), int(args.seed))
 
     print("=" * 80)
-    print("RUNNING PAIRED BENCHMARK GENERATION V6 (Requests: %d, Seed: %d)" % (args.requests, args.seed))
+    print("RUNNING PAIRED BENCHMARK GENERATION V6.1 (Requests: %d, Seed: %d)" % (args.requests, args.seed))
     print("=" * 80)
 
     result = generate_paired_benchmark(args, config, output_root, prior_dataset, rows)
